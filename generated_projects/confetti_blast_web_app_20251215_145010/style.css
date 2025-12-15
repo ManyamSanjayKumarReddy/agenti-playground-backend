@@ -1,0 +1,95 @@
+/* Global Styles */
+
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    font-family: Arial, sans-serif;
+    line-height: 1.6;
+    background-color: #f4f4f4;
+    color: #333;
+}
+
+.container {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 0 15px;
+}
+
+.header, .footer {
+    background: #35424a;
+    color: #ffffff;
+    padding: 20px 0;
+    text-align: center;
+}
+
+.header h1, .footer h1 {
+    font-size: 2em;
+}
+
+@media (max-width: 768px) {
+    .header h1, .footer h1 {
+        font-size: 1.5em;
+    }
+}
+
+/* Responsive Typography */
+
+h1 {
+    font-size: 2.5rem;
+}
+
+h2 {
+    font-size: 2rem;
+}
+
+h3 {
+    font-size: 1.75rem;
+}
+
+p {
+    font-size: 1rem;
+}
+
+@media (max-width: 600px) {
+    h1 {
+        font-size: 1.8rem;
+    }
+    h2 {
+        font-size: 1.5rem;
+    }
+    h3 {
+        font-size: 1.2rem;
+    }
+    p {
+        font-size: 0.9rem;
+    }
+}
+
+/* Flexbox for Layout */
+
+.flex {
+    display: flex;
+    justify-content: space-between;
+    flex-wrap: wrap;
+}
+
+.flex-item {
+    flex: 1 1 calc(33.333% - 20px);
+    margin: 10px;
+}
+
+@media (max-width: 768px) {
+    .flex-item {
+        flex: 1 1 calc(50% - 20px);
+    }
+}
+
+@media (max-width: 480px) {
+    .flex-item {
+        flex: 1 1 100%;
+    }
+}

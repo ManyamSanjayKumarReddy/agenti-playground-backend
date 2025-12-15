@@ -1,0 +1,44 @@
+.body {
+    margin: 0;
+    font-family: Arial, sans-serif;
+}
+
+.container {
+    width: 100%;
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 20px;
+}
+
+h1, h2, h3 {
+    color: #333;
+}
+
+p {
+    line-height: 1.6;
+    color: #666;
+}
+
+@media (max-width: 768px) {
+    .container {
+        padding: 10px;
+    }
+    h1 {
+        font-size: 1.5em;
+    }
+    h2 {
+        font-size: 1.25em;
+    }
+}
+
+@media (max-width: 480px) {
+    h1 {
+        font-size: 1.2em;
+    }
+    h2 {
+        font-size: 1.1em;
+    }
+    p {
+        font-size: 0.9em;
+    }
+}

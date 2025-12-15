@@ -1,0 +1,71 @@
+.error-page {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
+    background-color: #f0f0f0;
+    color: #333;
+    font-family: Arial, sans-serif;
+}
+
+.error-page h1 {
+    font-size: 5rem;
+    margin: 0;
+}
+
+.error-page p {
+    font-size: 1.5rem;
+}
+
+.error-page a {
+    margin-top: 20px;
+    padding: 10px 20px;
+    background-color: #007bff;
+    color: white;
+    text-decoration: none;
+    border-radius: 5px;
+}
+
+.error-page a:hover {
+    background-color: #0056b3;
+}
+
+.error-message {
+    margin-top: 20px;
+    font-size: 1.2rem;
+    color: #d9534f;
+    text-align: center;
+    padding: 10px;
+    border: 1px solid #d9534f;
+    background-color: #f2dede;
+    border-radius: 5px;
+}
+
+.error-page a {
+    font-size: 1.2rem;
+    transition: background-color 0.3s;
+}
+
+.error-page a:hover {
+    background-color: #0056b3;
+    transform: scale(1.05);
+}
+
+.error-page .search-bar {
+    margin-top: 30px;
+    padding: 10px;
+    border: 1px solid #ccc;
+    border-radius: 5px;
+    width: 300px;
+    font-size: 1rem;
+}
+
+.error-page .search-bar::placeholder {
+    color: #aaa;
+}
+
+.error-page .search-bar:focus {
+    border-color: #007bff;
+    outline: none;
+}
