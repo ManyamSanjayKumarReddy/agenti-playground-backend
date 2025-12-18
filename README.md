@@ -201,12 +201,3 @@ These will be added **after** core stability.
 * REST APIs are **control and metadata only**
 
 ---
-
-## Final Notes
-
-* The platform is **already stable and functional**
-* Upcoming work is **feature expansion**, not refactoring
-* WebSocket terminal is the **execution authority**
-* REST APIs are **control and metadata only**
-
----
