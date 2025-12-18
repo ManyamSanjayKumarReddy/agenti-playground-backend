@@ -1,12 +1,5 @@
 # AI Project Builder – Runtime & Agentic Execution Platform
 
-## OverviewBelow is a **clean, production-grade README** that reflects your **current system state**, **new requirements**, and a **clear priority-driven roadmap**.
-This is written so it can be shared with **UI team, backend contributors, and ops** without further explanation.
-
----
-
-# AI Project Builder – Runtime & Agentic Execution Platform
-
 ## Overview
 
 AI Project Builder is an **agentic, backend-first execution platform** designed to:
