@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from fastapi.responses import JSONResponse
@@ -11,9 +11,20 @@ from agent_v1.api.schemas import (
     GenerateProjectResponse,
     ListFilesResponse,
     ReadFileResponse,
+    WriteFileRequest,
 )
 from agent_v1.api.project_utils import resolve_project_dir, GENERATED_PROJECTS_ROOT
-from agent_v1.tools.filesystem import set_project_root, list_files, read_file
+
+from agent_v1.tools.utils import (
+    api_set_project_root,
+    api_list_files,
+    api_read_file,
+    api_write_file,
+    api_delete_file,
+    api_create_folder,
+    api_delete_folder,
+)
+
 from agent_v1.api.runtime_routes import router as runtime_router
 from agent_v1.api.db.config import init_db
 from agent_v1.runtime.reconcile import reconcile_runtimes_on_startup
@@ -21,6 +32,7 @@ from agent_v1.runtime.terminal_manager import terminal_manager
 from agent_v1.core.logging import setup_logging
 from agent_v1.core.middleware import request_id_middleware
 from agent_v1.runtime.command_policy import CommandRejected
+from agent_v1.api.admin_routes import router as admin_router
 
 # -------------------------------------------------------------------
 # Logging
@@ -34,31 +46,14 @@ setup_logging()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Application lifecycle management.
-
-    Startup:
-    - Initialize database
-    - Reconcile DB runtime state with Docker
-
-    Shutdown:
-    - Close active terminal sessions
-    - Close database connections
-    """
-    # 🔥 Initialize DB and bind models
     await init_db()
-
-    # 🔥 Sync runtime DB state with Docker
     await reconcile_runtimes_on_startup()
-
     yield
-
-    # 🔻 Shutdown cleanup
     terminal_manager.sessions.clear()
     await Tortoise.close_connections()
 
 # -------------------------------------------------------------------
-# FastAPI App
+# App
 # -------------------------------------------------------------------
 
 app = FastAPI(
@@ -86,44 +81,31 @@ app.middleware("http")(request_id_middleware)
 # -------------------------------------------------------------------
 
 app.include_router(runtime_router)
+app.include_router(admin_router)
+
 
 # -------------------------------------------------------------------
-# Health & Readiness
+# Health
 # -------------------------------------------------------------------
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 @app.get("/ready")
-async def readiness_check():
-    """
-    Readiness probe:
-    - Confirms DB connectivity
-    """
+async def ready():
     try:
         await Tortoise.get_connection("default").execute_query("SELECT 1")
         return {"status": "ready"}
     except Exception as e:
         return {"status": "not_ready", "error": str(e)}
 
-
-@app.get("/health")
-def health_check():
-    """
-    Liveness probe.
-    """
-    return {
-        "status": "ok",
-        "service": "AI Project Builder API",
-        "version": "1.0.0",
-    }
-
 # -------------------------------------------------------------------
-# Project Management
+# Projects
 # -------------------------------------------------------------------
 
 @app.get("/projects", response_model=list[str])
-def list_all_projects():
-    """
-    List all generated projects on disk.
-    """
+def list_projects():
     if not GENERATED_PROJECTS_ROOT.exists():
         return []
 
@@ -134,9 +116,6 @@ def list_all_projects():
 
 @app.post("/projects/generate", response_model=GenerateProjectResponse)
 def generate_project(req: GenerateProjectRequest):
-    """
-    Generate a new project using the agent pipeline.
-    """
     result = run_agent(req.prompt)
 
     coder_state = result.get("coder_state")
@@ -152,7 +131,7 @@ def generate_project(req: GenerateProjectRequest):
     )
 
 # -------------------------------------------------------------------
-# File System APIs (Read-Only)
+# Files
 # -------------------------------------------------------------------
 
 @app.get(
@@ -160,16 +139,13 @@ def generate_project(req: GenerateProjectRequest):
     response_model=ListFilesResponse,
 )
 def list_project_files(project_name: str):
-    """
-    List files inside a generated project.
-    """
     project_dir = resolve_project_dir(project_name)
-    set_project_root(str(project_dir))
+    api_set_project_root(str(project_dir))
 
-    files_output = list_files.run(".")
+    output = api_list_files(".")
     files = (
-        files_output.split("\n")
-        if files_output and "No files found" not in files_output
+        output.split("\n")
+        if output and "No files found" not in output
         else []
     )
 
@@ -184,13 +160,10 @@ def list_project_files(project_name: str):
     response_model=ReadFileResponse,
 )
 def read_project_file(project_name: str, file_path: str):
-    """
-    Read a specific file from a project.
-    """
     project_dir = resolve_project_dir(project_name)
-    set_project_root(str(project_dir))
+    api_set_project_root(str(project_dir))
 
-    content = read_file.run(file_path)
+    content = api_read_file(file_path)
     if content.startswith("ERROR"):
         raise HTTPException(status_code=400, detail=content)
 
@@ -200,16 +173,64 @@ def read_project_file(project_name: str, file_path: str):
         content=content,
     )
 
+
+@app.post("/projects/{project_name}/files/write")
+def write_project_file(
+    project_name: str,
+    file_path: str,
+    payload: WriteFileRequest = Body(...),
+):
+    project_dir = resolve_project_dir(project_name)
+    api_set_project_root(str(project_dir))
+
+    result = api_write_file(
+        path=file_path,
+        content=payload.content,
+    )
+
+    return {"result": result}
+
+
+@app.delete("/projects/{project_name}/files/delete")
+def delete_project_file(project_name: str, file_path: str):
+    project_dir = resolve_project_dir(project_name)
+    api_set_project_root(str(project_dir))
+
+    result = api_delete_file(file_path)
+    if result.startswith("ERROR"):
+        raise HTTPException(status_code=400, detail=result)
+
+    return {"result": result}
+
+# -------------------------------------------------------------------
+# Folders
+# -------------------------------------------------------------------
+
+@app.post("/projects/{project_name}/folders/create")
+def create_project_folder(project_name: str, folder_path: str):
+    project_dir = resolve_project_dir(project_name)
+    api_set_project_root(str(project_dir))
+
+    return {"result": api_create_folder(folder_path)}
+
+
+@app.delete("/projects/{project_name}/folders/delete")
+def delete_project_folder(project_name: str, folder_path: str):
+    project_dir = resolve_project_dir(project_name)
+    api_set_project_root(str(project_dir))
+
+    result = api_delete_folder(folder_path)
+    if result.startswith("ERROR"):
+        raise HTTPException(status_code=400, detail=result)
+
+    return {"result": result}
+
 # -------------------------------------------------------------------
 # Exception Handling
 # -------------------------------------------------------------------
 
 @app.exception_handler(CommandRejected)
 async def command_rejected_handler(_, exc: CommandRejected):
-    """
-    Handles rejected REST-based commands.
-    (Not used by WebSocket terminals)
-    """
     return JSONResponse(
         status_code=422,
         content={

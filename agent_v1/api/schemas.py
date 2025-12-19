@@ -16,3 +16,6 @@ class ReadFileResponse(BaseModel):
     project_name: str
     file_path: str
     content: str
+
+class WriteFileRequest(BaseModel):
+    content: str
