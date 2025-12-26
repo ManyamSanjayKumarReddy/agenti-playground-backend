@@ -1,0 +1,2402 @@
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import Optional
+from tortoise import Tortoise
+
+
+class Settings(BaseSettings):
+    DATABASE_URL: str
+
+    OPENAI_API_KEY: Optional[str] = None
+    GROQ_API_KEY: Optional[str] = None
+    LANGSMITH_TRACING: Optional[bool] = False
+    LANGSMITH_API_KEY: Optional[str] = None
+    LANGSMITH_PROJECT: Optional[str] = None
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_prefix="",
+        extra="forbid",
+    )
+
+
+Config = Settings()
+
+MODELS_LIST = [
+    "agent_v1.api.db.models",
+    "aerich.models",
+]
+
+tortoise_config = {
+    "connections": {
+        "default": Config.DATABASE_URL,
+    },
+    "apps": {
+        "models": {
+            "models": MODELS_LIST,
+            "default_connection": "default",
+        },
+    },
+    "use_tz": True,
+    "timezone": "UTC",
+}
+
+
+async def init_db() -> None:
+    """
+    Explicit, deterministic DB initialization.
+    REQUIRED when accessing models during startup.
+    """
+    await Tortoise.init(config=tortoise_config)
+
+config.py
+
+
+from tortoise import fields
+from tortoise.models import Model
+
+
+class ProjectRuntime(Model):
+    """
+    Persistent runtime state for each generated project.
+
+    Design Principles:
+    ------------------
+    - Backend manages ONLY the Docker container lifecycle.
+    - Application processes (Flask / FastAPI / Streamlit / agents)
+      are user-controlled via WebSocket terminal.
+    - No backend-level process tracking is performed.
+
+    This model intentionally avoids process-level state
+    to prevent false or misleading runtime information.
+    """
+
+    id = fields.UUIDField(pk=True)
+
+    # Unique project identifier (matches generated project folder)
+    project_name = fields.CharField(
+        max_length=255,
+        unique=True,
+        index=True,
+    )
+
+    # Absolute path to project directory on host
+    project_root = fields.TextField()
+
+    # Docker container name bound to this project
+    container_name = fields.CharField(
+        max_length=255,
+        unique=True,
+    )
+
+    # Base image used for the container runtime
+    image = fields.CharField(
+        max_length=255,
+        default="python:3.11-slim",
+    )
+
+    # Docker container lifecycle state
+    # Values: running | stopped
+    status = fields.CharField(
+        max_length=32,
+        default="stopped",
+    )
+
+    # Optional audit field for last executed command
+    # (purely informational, not a source of truth)
+    last_command = fields.TextField(
+        null=True,
+    )
+
+    # Metadata
+    created_at = fields.DatetimeField(
+        auto_now_add=True,
+    )
+
+    updated_at = fields.DatetimeField(
+        auto_now=True,
+    )
+
+    class Meta:
+        table = "project_runtime"
+
+    def __str__(self):
+        return f"<Runtime {self.project_name} ({self.status})>"
+
+
+models.py
+
+
+"""
+Purpose:
+--------
+Admin-only API for global runtime and project management.
+
+Admin Capabilities:
+-------------------
+- List ALL runtimes (across projects)
+- Get status of any container
+- Stop any container
+- Delete any container
+- Delete project completely (disk + runtime + container)
+
+Security Model:
+---------------
+- This router is intended to be protected by admin auth middleware.
+- No project ownership checks are enforced here.
+"""
+
+from fastapi import APIRouter, HTTPException
+from typing import List
+from pydantic import BaseModel
+
+import shutil
+
+from agent_v1.runtime.repository import RuntimeRepository, RuntimeNotFound
+from agent_v1.runtime.docker_manager import docker_manager, DockerError
+from agent_v1.runtime.terminal_manager import terminal_manager
+from agent_v1.api.project_utils import GENERATED_PROJECTS_ROOT
+
+router = APIRouter(prefix="/admin", tags=["admin"])
+repo = RuntimeRepository()
+
+# -------------------------------------------------------------------
+# Response Models
+# -------------------------------------------------------------------
+
+class AdminRuntimeInfo(BaseModel):
+    project_name: str
+    status: str
+    container_id: str | None
+    image: str
+
+
+# -------------------------------------------------------------------
+# Runtime Management (Admin)
+# -------------------------------------------------------------------
+
+@router.get("/runtimes", response_model=List[AdminRuntimeInfo])
+async def list_all_runtimes():
+    """
+    List all runtimes across all projects.
+    """
+    runtimes = await repo.list_all()
+
+    return [
+        AdminRuntimeInfo(
+            project_name=r.project_name,
+            status=r.status,
+            container_id=r.container_name,
+            image=r.image,
+        )
+        for r in runtimes
+    ]
+
+
+@router.post("/runtimes/{project_name}/stop")
+async def admin_stop_runtime(project_name: str):
+    """
+    Stop any container (admin privilege).
+    """
+    try:
+        await docker_manager.stop_container(project_name)
+        terminal_manager.close(project_name)
+        return {"status": "stopped", "project": project_name}
+
+    except RuntimeNotFound:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No runtime found for project: {project_name}",
+        )
+
+
+@router.delete("/runtimes/{project_name}")
+async def admin_delete_runtime(project_name: str):
+    """
+    Delete a runtime and container (admin privilege).
+    """
+    try:
+        terminal_manager.close(project_name)
+        await docker_manager.remove_container(project_name)
+        return {"status": "deleted", "project": project_name}
+
+    except RuntimeNotFound:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No runtime found for project: {project_name}",
+        )
+    except DockerError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# -------------------------------------------------------------------
+# Project Deletion (Admin)
+# -------------------------------------------------------------------
+
+@router.delete("/projects/{project_name}")
+async def admin_delete_project(project_name: str):
+    """
+    Completely delete a project:
+    - Stop container (if running)
+    - Delete container & runtime
+    - Remove project files from disk
+
+    THIS IS DESTRUCTIVE.
+    """
+    project_path = GENERATED_PROJECTS_ROOT / project_name
+
+    # 1. Stop & remove runtime if exists
+    try:
+        terminal_manager.close(project_name)
+        await docker_manager.remove_container(project_name)
+    except RuntimeNotFound:
+        pass  # Project may exist without runtime
+    except DockerError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # 2. Delete project directory
+    if project_path.exists():
+        shutil.rmtree(project_path)
+    else:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Project directory not found: {project_name}",
+        )
+
+    return {
+        "status": "project_deleted",
+        "project": project_name,
+    }
+
+
+admin routes.py
+
+
+from fastapi import FastAPI, HTTPException, Body
+from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
+from fastapi.responses import JSONResponse
+
+from tortoise import Tortoise
+
+from agent_v1.graph.graph import run_agent
+from agent_v1.api.schemas import (
+    GenerateProjectRequest,
+    GenerateProjectResponse,
+    ListFilesResponse,
+    ReadFileResponse,
+    WriteFileRequest,
+)
+from agent_v1.api.project_utils import resolve_project_dir, GENERATED_PROJECTS_ROOT
+
+from agent_v1.tools.utils import (
+    api_set_project_root,
+    api_list_files,
+    api_read_file,
+    api_write_file,
+    api_delete_file,
+    api_create_folder,
+    api_delete_folder,
+)
+
+from agent_v1.api.runtime_routes import router as runtime_router
+from agent_v1.api.db.config import init_db
+from agent_v1.runtime.reconcile import reconcile_runtimes_on_startup
+from agent_v1.runtime.terminal_manager import terminal_manager
+from agent_v1.core.logging import setup_logging
+from agent_v1.core.middleware import request_id_middleware
+from agent_v1.runtime.command_policy import CommandRejected
+from agent_v1.api.admin_routes import router as admin_router
+
+# -------------------------------------------------------------------
+# Logging
+# -------------------------------------------------------------------
+
+setup_logging()
+
+# -------------------------------------------------------------------
+# Application Lifespan
+# -------------------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    await reconcile_runtimes_on_startup()
+    yield
+    terminal_manager.sessions.clear()
+    await Tortoise.close_connections()
+
+# -------------------------------------------------------------------
+# App
+# -------------------------------------------------------------------
+
+app = FastAPI(
+    title="AI Project Builder API",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+# -------------------------------------------------------------------
+# Middleware
+# -------------------------------------------------------------------
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.middleware("http")(request_id_middleware)
+
+# -------------------------------------------------------------------
+# Routers
+# -------------------------------------------------------------------
+
+app.include_router(runtime_router)
+app.include_router(admin_router)
+
+
+# -------------------------------------------------------------------
+# Health
+# -------------------------------------------------------------------
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.get("/ready")
+async def ready():
+    try:
+        await Tortoise.get_connection("default").execute_query("SELECT 1")
+        return {"status": "ready"}
+    except Exception as e:
+        return {"status": "not_ready", "error": str(e)}
+
+# -------------------------------------------------------------------
+# Projects
+# -------------------------------------------------------------------
+
+@app.get("/projects", response_model=list[str])
+def list_projects():
+    if not GENERATED_PROJECTS_ROOT.exists():
+        return []
+
+    return sorted(
+        p.name for p in GENERATED_PROJECTS_ROOT.iterdir() if p.is_dir()
+    )
+
+
+@app.post("/projects/generate", response_model=GenerateProjectResponse)
+def generate_project(req: GenerateProjectRequest):
+    result = run_agent(req.prompt)
+
+    coder_state = result.get("coder_state")
+    if not coder_state:
+        raise HTTPException(status_code=500, detail="Project generation failed")
+
+    project_root = coder_state.project_root
+    project_name = project_root.split("/")[-1]
+
+    return GenerateProjectResponse(
+        project_name=project_name,
+        project_root=project_root,
+    )
+
+# -------------------------------------------------------------------
+# Files
+# -------------------------------------------------------------------
+
+@app.get(
+    "/projects/{project_name}/files",
+    response_model=ListFilesResponse,
+)
+def list_project_files(project_name: str):
+    project_dir = resolve_project_dir(project_name)
+    api_set_project_root(str(project_dir))
+
+    output = api_list_files(".")
+    files = (
+        output.split("\n")
+        if output and "No files found" not in output
+        else []
+    )
+
+    return ListFilesResponse(
+        project_name=project_name,
+        files=files,
+    )
+
+
+@app.get(
+    "/projects/{project_name}/files/read",
+    response_model=ReadFileResponse,
+)
+def read_project_file(project_name: str, file_path: str):
+    project_dir = resolve_project_dir(project_name)
+    api_set_project_root(str(project_dir))
+
+    content = api_read_file(file_path)
+    if content.startswith("ERROR"):
+        raise HTTPException(status_code=400, detail=content)
+
+    return ReadFileResponse(
+        project_name=project_name,
+        file_path=file_path,
+        content=content,
+    )
+
+
+@app.post("/projects/{project_name}/files/write")
+def write_project_file(
+    project_name: str,
+    file_path: str,
+    payload: WriteFileRequest = Body(...),
+):
+    project_dir = resolve_project_dir(project_name)
+    api_set_project_root(str(project_dir))
+
+    result = api_write_file(
+        path=file_path,
+        content=payload.content,
+    )
+
+    return {"result": result}
+
+
+@app.delete("/projects/{project_name}/files/delete")
+def delete_project_file(project_name: str, file_path: str):
+    project_dir = resolve_project_dir(project_name)
+    api_set_project_root(str(project_dir))
+
+    result = api_delete_file(file_path)
+    if result.startswith("ERROR"):
+        raise HTTPException(status_code=400, detail=result)
+
+    return {"result": result}
+
+# -------------------------------------------------------------------
+# Folders
+# -------------------------------------------------------------------
+
+@app.post("/projects/{project_name}/folders/create")
+def create_project_folder(project_name: str, folder_path: str):
+    project_dir = resolve_project_dir(project_name)
+    api_set_project_root(str(project_dir))
+
+    return {"result": api_create_folder(folder_path)}
+
+
+@app.delete("/projects/{project_name}/folders/delete")
+def delete_project_folder(project_name: str, folder_path: str):
+    project_dir = resolve_project_dir(project_name)
+    api_set_project_root(str(project_dir))
+
+    result = api_delete_folder(folder_path)
+    if result.startswith("ERROR"):
+        raise HTTPException(status_code=400, detail=result)
+
+    return {"result": result}
+
+# -------------------------------------------------------------------
+# Exception Handling
+# -------------------------------------------------------------------
+
+@app.exception_handler(CommandRejected)
+async def command_rejected_handler(_, exc: CommandRejected):
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": "command_rejected",
+            "detail": str(exc),
+        },
+    )
+
+main.py
+
+
+import pathlib
+from agent_v1.tools.project_root import GENERATED_PROJECTS_ROOT
+
+def resolve_project_dir(project_name: str) -> pathlib.Path:
+    """
+    Resolves an existing project directory by name.
+    """
+    project_dir = GENERATED_PROJECTS_ROOT / project_name
+
+    if not project_dir.exists():
+        raise FileNotFoundError(f"Project not found: {project_name}")
+
+    if not project_dir.is_dir():
+        raise ValueError(f"Invalid project directory: {project_name}")
+
+    return project_dir.resolve()
+
+
+project utils.py
+
+
+"""
+Purpose:
+--------
+HTTP + WebSocket API for runtime management.
+
+Design Philosophy:
+------------------
+- Backend manages ONLY Docker container lifecycle.
+- Application processes (Flask / FastAPI / Streamlit / agents)
+  are user-controlled via WebSocket terminal.
+- No backend-level process state is tracked.
+
+Exposes:
+---------
+- Start container
+- Stop container
+- Delete container
+- Get container runtime status
+- WebSocket terminal (xterm.js)
+"""
+
+from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
+import asyncio
+from pydantic import BaseModel
+from typing import Optional
+
+from agent_v1.runtime.docker_manager import docker_manager, DockerError
+from agent_v1.runtime.repository import RuntimeRepository, RuntimeNotFound
+from agent_v1.runtime.terminal_manager import terminal_manager
+from agent_v1.api.project_utils import resolve_project_dir
+
+router = APIRouter(prefix="/projects", tags=["runtime"])
+repo = RuntimeRepository()
+
+
+# -------------------------------------------------------------------
+# Response Models
+# -------------------------------------------------------------------
+
+class StartRuntimeResponse(BaseModel):
+    project_name: str
+    status: str
+    container_id: str
+    image: str
+
+
+class RuntimeStatusResponse(BaseModel):
+    project_name: str
+    container_status: str
+    container_id: Optional[str]
+    image: str
+
+
+# -------------------------------------------------------------------
+# Container Lifecycle
+# -------------------------------------------------------------------
+
+@router.post("/{project_name}/runtime/start", response_model=StartRuntimeResponse)
+async def start_runtime(project_name: str):
+    """
+    Create (if needed) and start the Docker container for a project.
+
+    Behavior:
+    - Validates project exists on disk
+    - Creates container + DB record if missing
+    - Starts container (idempotent)
+    """
+    try:
+        resolve_project_dir(project_name)
+
+        try:
+            runtime = await repo.get(project_name)
+        except RuntimeNotFound:
+            await docker_manager.create_container(project_name)
+            runtime = await repo.get(project_name)
+
+        await docker_manager.start_container(project_name)
+        runtime = await repo.get(project_name)
+
+        return StartRuntimeResponse(
+            project_name=runtime.project_name,
+            status=runtime.status,
+            container_id=runtime.container_name,
+            image=runtime.image,
+        )
+
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Project not found: {project_name}",
+        )
+    except DockerError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/{project_name}/runtime/status", response_model=RuntimeStatusResponse)
+async def runtime_status(project_name: str):
+    """
+    Returns the current container runtime status.
+
+    This is the single source of truth for the UI.
+    """
+    try:
+        r = await repo.get(project_name)
+
+        return RuntimeStatusResponse(
+            project_name=r.project_name,
+            container_status=r.status,
+            container_id=r.container_name,
+            image=r.image,
+        )
+
+    except RuntimeNotFound:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No runtime found for project: {project_name}",
+        )
+
+
+@router.post("/{project_name}/runtime/stop")
+async def stop_runtime(project_name: str):
+    """
+    Stop the Docker container.
+
+    Notes:
+    - Safe to call even if container is already stopped
+    - Terminal session (if any) will be closed automatically
+    """
+    try:
+        await docker_manager.stop_container(project_name)
+        terminal_manager.close(project_name)
+        return {"status": "stopped"}
+
+    except RuntimeNotFound:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No runtime found for project: {project_name}",
+        )
+
+
+@router.delete("/{project_name}/runtime")
+async def delete_runtime(project_name: str):
+    """
+    Remove the Docker container and delete the runtime record.
+
+    This is a destructive operation.
+    """
+    try:
+        terminal_manager.close(project_name)
+        await docker_manager.remove_container(project_name)
+        return {"status": "deleted"}
+
+    except RuntimeNotFound:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No runtime found for project: {project_name}",
+        )
+
+
+# -------------------------------------------------------------------
+# WebSocket Terminal
+# -------------------------------------------------------------------
+@router.websocket("/{project_name}/runtime/ws/terminal")
+async def runtime_terminal_ws(websocket: WebSocket, project_name: str):
+    await websocket.accept()
+
+    runtime = await repo.get(project_name)
+    if runtime.status != "running":
+        await websocket.send_text("Container not running")
+        return  # FastAPI will close socket
+
+    session = terminal_manager.get_or_create(
+        project_name,
+        runtime.container_name,
+    )
+
+    async def push_output():
+        while True:
+            data = session.read()
+            if data:
+                await websocket.send_text(data)
+            await asyncio.sleep(0.01)
+
+    task = asyncio.create_task(push_output())
+
+    try:
+        while True:
+            msg = await websocket.receive_text()
+            session.write(msg)
+
+    except WebSocketDisconnect:
+        pass
+
+    finally:
+        terminal_manager.close(project_name)
+        task.cancel()
+
+
+runtime routes.py
+
+
+from pydantic import BaseModel, Field
+from typing import List
+
+class GenerateProjectRequest(BaseModel):
+    prompt: str = Field(..., description="User prompt to generate the project")
+
+class GenerateProjectResponse(BaseModel):
+    project_name: str
+    project_root: str
+
+class ListFilesResponse(BaseModel):
+    project_name: str
+    files: List[str]
+
+class ReadFileResponse(BaseModel):
+    project_name: str
+    file_path: str
+    content: str
+
+class WriteFileRequest(BaseModel):
+    content: str
+
+
+
+schemas.py
+
+
+import logging
+import sys
+import json
+from datetime import datetime
+
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        log = {
+            "timestamp": datetime.now().isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+
+        if hasattr(record, "request_id"):
+            log["request_id"] = record.request_id
+
+        if record.exc_info:
+            log["exception"] = self.formatException(record.exc_info)
+
+        return json.dumps(log)
+
+
+def setup_logging():
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(JsonFormatter())
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.handlers.clear()
+    root.addHandler(handler)
+
+logging.py
+import uuid
+import logging
+from fastapi import Request
+
+logger = logging.getLogger("request")
+
+
+async def request_id_middleware(request: Request, call_next):
+    request_id = str(uuid.uuid4())
+    request.state.request_id = request_id
+
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
+
+middleware.py
+
+
+
+import os
+from typing import Dict, Any
+
+from dotenv import load_dotenv
+from langchain_openai import ChatOpenAI
+from langgraph.graph import StateGraph
+from langgraph.constants import END
+from langchain.agents import create_agent
+
+from agent_v1.graph.states import File, Plan, TaskPlan, CoderState
+from agent_v1.prompts.prompts import planner_prompt, architect_prompt, coder_system_prompt
+from agent_v1.tools.filesystem import read_file, write_file, list_files, get_current_directory, set_project_root
+from agent_v1.tools.project_root import create_project_root
+
+# Environment & LLM Setup
+def get_llm() -> ChatOpenAI:
+    """
+    Centralized LLM factory.
+    Makes switching models or providers easy.
+    """
+    return ChatOpenAI(
+        model="gpt-4o-mini-2024-07-18",
+        temperature=0.6
+    )
+
+def init_environment() -> None:
+    """
+    Initialize environment variables once.
+    Safe to call multiple times.
+    """
+    os.environ.setdefault("LANGSMITH_TRACING", "true")
+    load_dotenv()
+
+# Agent Nodes
+def planner_agent(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Converts user prompt into a structured Plan.
+    """
+    llm = get_llm()
+    user_prompt = state["user_prompt"]
+
+    plan = llm.with_structured_output(Plan).invoke(
+        planner_prompt(user_prompt)
+    )
+
+    if not plan:
+        raise ValueError("Planner agent returned empty output")
+
+    return {"plan": plan}
+
+
+def architect_agent(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Converts Plan into TaskPlan.
+    """
+    llm = get_llm()
+    plan: Plan = state["plan"]
+
+    task_plan = llm.with_structured_output(TaskPlan).invoke(
+        architect_prompt(plan)
+    )
+
+    if not task_plan:
+        raise ValueError("Architect agent returned empty output")
+
+    return { "plan": plan, "task_plan": task_plan}
+
+
+def coder_agent(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Iterative tool-using coding agent.
+    """
+    llm = get_llm()
+
+    coder_state: CoderState | None = state.get("coder_state")
+
+    if coder_state is None:
+        project_dir = create_project_root(state["plan"].name)
+        coder_state = CoderState(
+            task_plan=state["task_plan"],
+            project_root=str(project_dir),
+            current_step_idx=0
+        )
+
+    set_project_root(coder_state.project_root)
+
+    steps = coder_state.task_plan.implementation_steps
+
+    if coder_state.current_step_idx >= len(steps):
+        return {
+            "coder_state": coder_state,
+            "status": "DONE"
+        }
+
+    current_task = steps[coder_state.current_step_idx]
+
+    existing_content = read_file.run(current_task.filepath)
+
+    system_prompt = coder_system_prompt()
+    user_prompt = (
+        f"Task: {current_task.task_description}\n"
+        f"File: {current_task.filepath}\n\n"
+        f"Existing Content:\n{existing_content}\n\n"
+        "Use write_file(path, content) to save your changes."
+    )
+
+    tools = [
+        read_file,
+        write_file,
+        list_files,
+        get_current_directory,
+    ]
+
+    agent = create_agent(
+        model=llm,
+        tools=tools,
+        system_prompt=system_prompt
+    )
+
+    agent.invoke(
+        {"messages": [{"role": "user", "content": user_prompt}]}
+    )
+
+    coder_state.current_step_idx += 1
+
+    return {"coder_state": coder_state}
+
+# Graph Factory
+def build_graph():
+    """
+    Builds and compiles the LangGraph.
+    Safe to reuse across API calls.
+    """
+    graph = StateGraph(dict)
+
+    graph.add_node("planner", planner_agent)
+    graph.add_node("architect", architect_agent)
+    graph.add_node("coder", coder_agent)
+
+    graph.add_edge("planner", "architect")
+    graph.add_edge("architect", "coder")
+
+    graph.add_conditional_edges(
+        "coder",
+        lambda state: "END" if state.get("status") == "DONE" else "coder",
+        {
+            "END": END,
+            "coder": "coder"
+        }
+    )
+
+    graph.set_entry_point("planner")
+
+    return graph.compile()
+
+# Public API (FastAPI-friendly)
+def run_agent(user_prompt: str) -> Dict[str, Any]:
+    """
+    Public callable entry point.
+    This is what FastAPI should call.
+    """
+    init_environment()
+    agent = build_graph()
+
+    return agent.invoke(
+        {"user_prompt": user_prompt}
+    )
+
+
+# Local CLI Test
+if __name__ == "__main__":
+    result = run_agent(
+        "build an 404 error page using internal css and html"
+    )
+
+    print("Final State:")
+    print(result)
+
+GRaph.py
+
+
+from pydantic import BaseModel, Field
+from typing import List, Optional
+
+# File Definition
+class File(BaseModel):
+    """
+    Represents a file to be created or modified in the project.
+    """
+    path: str = Field(
+        ...,
+        description="The relative path of the file to be created or modified"
+    )
+    purpose: str = Field(
+        ...,
+        description=(
+            "The purpose of the file. "
+            "Example: main application logic, data processing module, "
+            "pipeline, global CSS, configuration, etc."
+        )
+    )
+
+# High-Level Plan
+class Plan(BaseModel):
+    """
+    High-level application plan produced by the planner agent.
+    """
+    name: str = Field(
+        ...,
+        description="The name of the application to be built"
+    )
+
+    description: str = Field(
+        ...,
+        description=(
+            "A one-line description of the application. "
+            "Example: 'A web application for managing personal projects'"
+        )
+    )
+
+    techstack: str = Field(
+        ...,
+        description=(
+            "Technology stack to be used. "
+            "Example: Python, HTML, CSS, JavaScript, React, Flask, FastAPI"
+        )
+    )
+
+    features: List[str] = Field(
+        ...,
+        description=(
+            "List of features the application should support. "
+            "Example: user authentication, dashboards, API integration"
+        )
+    )
+
+    files: List[File] = Field(
+        ...,
+        description="List of files to be created along with their purposes"
+    )
+
+# Implementation-Level Tasks
+class ImplementationTask(BaseModel):
+    """
+    A single implementation step for the coder agent.
+    """
+    filepath: str = Field(
+        ...,
+        description="The file path that needs to be created or modified"
+    )
+
+    task_description: str = Field(
+        ...,
+        description=(
+            "Detailed description of the task to be performed. "
+            "Example: add authentication logic, create landing page UI, "
+            "implement API integration, etc."
+        )
+    )
+
+
+class TaskPlan(BaseModel):
+    """
+    Ordered list of implementation steps generated by the architect agent.
+    """
+    implementation_steps: List[ImplementationTask] = Field(
+        ...,
+        description="Sequential steps required to implement the application"
+    )
+
+
+# Coder Runtime State
+class CoderState(BaseModel):
+    """
+    Mutable runtime state for the coder agent while iterating through tasks.
+    """
+    task_plan: TaskPlan = Field(
+        ...,
+        description="The task plan being executed"
+    )
+
+    project_root: str = Field(
+        ...,
+        description="Absolute path to this project's root directory"
+    )
+
+    current_step_idx: int = Field(
+        0,
+        description="Index of the current implementation step"
+    )
+
+    current_file_content: Optional[str] = Field(
+        None,
+        description="Current content of the file being edited"
+    )
+
+states.py
+
+
+from agent_v1.graph.states import Plan
+
+# Planner Prompt
+def planner_prompt(user_prompt: str) -> str:
+    """
+    Planner agent prompt.
+    Produces a structured engineering plan for AI-agent-based Python projects.
+    """
+    return f"""
+You are the PLANNER agent.
+
+Your task is to convert a high-level or vague user request into a
+clear, complete, and actionable engineering project plan.
+
+PRIMARY FOCUS (IMPORTANT):
+- AI agents and agentic workflows
+- Python-based backends and tooling
+- Flask, FastAPI, or Streamlit applications
+- LLM orchestration, tools, APIs, pipelines, or automation systems
+
+You SHOULD assume:
+- Python is the default language unless explicitly stated otherwise
+- Backend-first architecture
+- Minimal or no frontend unless explicitly requested
+
+OUTPUT CONSTRAINTS (STRICT):
+- Output must conform EXACTLY to the Plan schema
+- Do NOT include explanations, markdown, or commentary
+- Produce a complete, internally consistent plan
+- Be concise, precise, and implementation-oriented
+
+PLANNING REQUIREMENTS:
+- Infer a meaningful and professional project name
+- Clearly describe the system’s purpose and agent responsibilities
+- Select an appropriate Python-based technology stack
+- Identify agent roles, tools, and workflows if applicable
+- Define user-facing APIs or interfaces (CLI, REST, Streamlit, etc.)
+- Declare all required files with clear responsibilities
+
+USER REQUEST:
+{user_prompt}
+"""
+
+# Architect Prompt
+def architect_prompt(plan: Plan) -> str:
+    """
+    Architect agent prompt.
+    Converts a validated AI-agent project Plan into executable tasks.
+    """
+    return f"""
+You are the ARCHITECT agent.
+
+Your responsibility is to transform an approved project Plan into a
+clear, ordered, and executable sequence of engineering tasks.
+
+This system is primarily:
+- AI-agent based
+- Python-first
+- Backend and tooling oriented
+
+You must think in terms of INCREMENTAL CONSTRUCTION:
+- Core logic before integration
+- Agents before orchestration
+- APIs before interfaces
+- Configuration before execution
+
+CORE RESPONSIBILITIES:
+- Break the Plan into clean, atomic implementation tasks
+- Define strict file ownership per task
+- Ensure tasks follow real dependency order
+- Optimize for Python, FastAPI, Flask, Streamlit, and agent frameworks
+
+CRITICAL FILE SYSTEM RULES (MANDATORY):
+- ALL file paths MUST be RELATIVE to the project root
+- NEVER use absolute paths
+- NEVER use ../ or any parent traversal
+- NEVER reference files not declared in the Plan
+- NEVER create files outside the declared structure
+
+VALID PATH EXAMPLES:
+- main.py
+- app.py
+- backend/api.py
+- agents/planner.py
+- tools/search.py
+- config/settings.py
+
+INVALID PATH EXAMPLES:
+- /home/user/app.py
+- ../agents/agent.py
+- ~/project/main.py
+- ../../backend/app.py
+
+TASK DESIGN RULES:
+- Each task MUST create or modify EXACTLY ONE file
+- Tasks MAY revisit the same file only if logically required
+- Tasks MUST be small, focused, and implementation-ready
+- Separate concerns strictly:
+  - agents
+  - tools
+  - orchestration
+  - API layers
+  - configuration
+
+INPUT PROJECT PLAN:
+{plan}
+
+OUTPUT CONSTRAINTS:
+- Output ONLY a TaskPlan object
+- Do NOT include explanations, markdown, or extra text
+"""
+
+# Coder System Prompt
+def coder_system_prompt() -> str:
+    """
+    System prompt for the coder agent.
+    """
+    return """
+You are the CODER agent.
+
+Your responsibility is to implement EXACTLY ONE assigned engineering task
+by creating or modifying ONE file in a correct, production-ready manner.
+
+PRIMARY CONTEXT:
+----------------
+- This project is AI-agent based
+- Python is the primary language
+- Common stacks include Flask, FastAPI, Streamlit, and agent frameworks
+- Code must be clean, deterministic, and production-ready
+
+AVAILABLE TOOLS (USE THESE ONLY):
+- read_file(path)
+- write_file(path, content)
+- list_files()
+- get_current_directory()
+
+MANDATORY TOOL RULES (STRICT):
+- ALWAYS check if the file exists
+- If the file exists, you MUST read it before modifying
+- If the file does not exist, create it using write_file
+- NEVER output code without saving it to a file
+- NEVER skip required tool calls
+
+MANDATORY IMPLEMENTATION RULES:
+- Implement the COMPLETE file content every time
+- Do NOT output partial snippets
+- Preserve valid existing logic unless explicitly instructed otherwise
+- Follow the Python stack defined in the Plan
+- Do NOT introduce unnecessary libraries
+- Do NOT modify files outside the assigned task
+
+AGENT-SPECIFIC RULES:
+- Prefer clarity over cleverness
+- Avoid premature abstractions
+- Ensure code is readable by other agents
+- Avoid side effects outside the file’s responsibility
+
+FILE SYSTEM SAFETY (CRITICAL):
+- Use ONLY relative paths
+- NEVER use absolute paths
+- NEVER use ../ or escape the project root
+- Operate ONLY on the file specified in the task
+
+REQUIRED WORKFLOW:
+1. Identify the target file
+2. Inspect project structure if needed
+3. Read the file if it exists
+4. Implement the FULL correct content
+5. Save the file using write_file
+
+FAILURE CONDITIONS (FORBIDDEN):
+- Do NOT explain your actions
+- Do NOT ask questions
+- Do NOT output code without saving
+- Do NOT modify unrelated files
+- Do NOT partially complete the task
+
+SUCCESS CONDITION:
+- The assigned file is fully implemented,
+  correctly integrated,
+  and saved using write_file(path, content)
+"""
+
+prompts.py
+
+
+
+"""
+Purpose:
+--------
+Defines the security policy for executing structured commands
+inside project Docker containers.
+
+This policy is used ONLY for:
+-----------------------------
+- REST-based command execution (future `/exec` endpoints)
+- Backend-triggered command execution
+
+This policy is NOT used for:
+----------------------------
+- WebSocket terminals
+- Interactive shells (xterm.js)
+
+Reason:
+-------
+Terminal access assumes trusted users during local development
+and agent experimentation. Enforcing this policy in terminals
+would break legitimate workflows (pip install, debugging, etc.).
+
+Responsibilities:
+-----------------
+- Allowlist safe, high-level commands (python, pip, flask, etc.)
+- Block shell escapes, command chaining, and privilege escalation
+- Prevent filesystem traversal and destructive operations
+"""
+
+import re
+from typing import List, Dict
+
+
+class CommandRejected(Exception):
+    """
+    Raised when a command or argument violates the security policy.
+
+    This exception should be caught at the API layer and returned
+    as a user-friendly error message.
+    """
+    pass
+
+
+# -------------------------------------------------------------------
+# BLOCKED PATTERNS
+# -------------------------------------------------------------------
+# These patterns are ALWAYS forbidden, regardless of command allowlist.
+#
+# They prevent:
+# - Shell command chaining
+# - Command substitution
+# - Privilege escalation
+# - Destructive filesystem access
+#
+# NOTE:
+# -----
+# This policy assumes commands are executed WITHOUT a shell
+# (subprocess list form, not shell=True).
+# -------------------------------------------------------------------
+
+BLOCKED_PATTERNS = [
+    r";",              # command chaining
+    r"&&",
+    r"\|\|",
+    r"\|",             # pipes
+    r"`",              # command substitution
+    r"\$\(",
+    r"\.\.",           # path traversal
+    r"~",              # home directory access
+    r"sudo",           # privilege escalation
+    r"ssh",
+    r"scp",
+    r"curl",
+    r"wget",
+    r"rm\s+-rf",       # destructive delete
+    r"chmod",
+    r"chown",
+    r"kill",
+    r"pkill",
+    r"mount",
+    r"umount",
+]
+
+# Precompile regexes once for performance
+_BLOCKED_REGEXES = [re.compile(p) for p in BLOCKED_PATTERNS]
+
+
+# -------------------------------------------------------------------
+# ALLOWED COMMANDS
+# -------------------------------------------------------------------
+# Defines which top-level commands may be executed via REST APIs.
+#
+# Structure:
+# ----------
+# - allow_any_args: True → arguments are not restricted
+# - allow_any_args: False → arguments must be explicitly allowlisted
+#
+# IMPORTANT:
+# ----------
+# This allowlist is intentionally conservative.
+# New commands should be added explicitly and reviewed.
+# -------------------------------------------------------------------
+
+ALLOWED_COMMANDS: Dict[str, Dict] = {
+    "python": {
+        "allow_any_args": True,
+    },
+    "pip": {
+        "allowed_args": ["install", "list", "freeze", "-r"],
+        "allow_any_args": False,
+    },
+    "flask": {
+        "allow_any_args": True,
+    },
+    "uvicorn": {
+        "allow_any_args": True,
+    },
+    "streamlit": {
+        "allow_any_args": True,
+    },
+    "pytest": {
+        "allow_any_args": True,
+    },
+}
+
+
+# -------------------------------------------------------------------
+# INTERNAL HELPERS
+# -------------------------------------------------------------------
+
+def _check_blocked(value: str):
+    """
+    Scan a string for blocked patterns.
+
+    This is applied to:
+    - Command name
+    - Each argument
+    - Working directory (cwd)
+
+    Raises:
+    -------
+    CommandRejected if a blocked pattern is found.
+    """
+    for regex in _BLOCKED_REGEXES:
+        if regex.search(value):
+            raise CommandRejected(
+                f"Blocked pattern detected: {regex.pattern}"
+            )
+
+
+# -------------------------------------------------------------------
+# PUBLIC VALIDATION API
+# -------------------------------------------------------------------
+
+def validate_command(command: str, args: List[str], cwd: str | None = None):
+    """
+    Validate a structured command before execution.
+
+    Parameters:
+    -----------
+    command : str
+        The executable name (e.g. 'python', 'pip', 'flask')
+    args : List[str]
+        List of command arguments
+    cwd : str | None
+        Optional working directory (must be relative)
+
+    Validation Rules:
+    -----------------
+    - Command must be explicitly allowlisted
+    - No shell operators or command substitution
+    - No absolute paths or path traversal
+    - Arguments must comply with command-specific rules
+
+    Returns:
+    --------
+    True if validation succeeds
+
+    Raises:
+    -------
+    CommandRejected if validation fails
+    """
+
+    # Command must be present
+    if not command:
+        raise CommandRejected("Command cannot be empty")
+
+    # Command must be allowlisted
+    if command not in ALLOWED_COMMANDS:
+        raise CommandRejected(f"Command not allowed: {command}")
+
+    # Validate command name
+    _check_blocked(command)
+
+    # Validate each argument
+    for arg in args:
+        _check_blocked(arg)
+
+    # Validate working directory (relative only)
+    if cwd:
+        _check_blocked(cwd)
+        if cwd.startswith("/"):
+            raise CommandRejected("Absolute paths are not allowed")
+
+    policy = ALLOWED_COMMANDS[command]
+
+    # Enforce argument allowlist if required
+    if not policy.get("allow_any_args"):
+        for arg in args:
+            if arg not in policy.get("allowed_args", []):
+                raise CommandRejected(
+                    f"Argument not allowed for '{command}': {arg}"
+                )
+
+    return True
+
+
+commandpolicy.py
+
+
+"""
+Purpose:
+--------
+Manages Docker container lifecycle for each generated project.
+
+Design Philosophy:
+------------------
+- This module is the SINGLE authority for Docker container lifecycle.
+- Backend manages containers, NOT application processes.
+- Application execution happens exclusively via WebSocket terminal.
+
+Responsibilities:
+-----------------
+- Create Docker containers with resource limits
+- Start, stop, and remove containers
+- Persist container lifecycle state in the database
+
+Explicitly DOES NOT:
+--------------------
+- Execute application commands
+- Manage processes inside containers
+- Handle terminals or WebSockets
+- Track application runtime state
+"""
+
+import subprocess
+import asyncio
+from typing import Optional
+
+from agent_v1.api.project_utils import resolve_project_dir
+from agent_v1.runtime.repository import RuntimeRepository
+
+
+class DockerError(Exception):
+    """
+    Raised when a Docker CLI operation fails.
+
+    This exception should be caught at the API layer
+    and translated into an HTTP error response.
+    """
+    pass
+
+
+class DockerManager:
+    """
+    Docker container lifecycle manager.
+
+    One Docker container is created per project and kept
+    alive using a long-running `sleep infinity` process.
+    """
+
+    DEFAULT_IMAGE = "python:3.11-slim"
+    WORKDIR = "/workspace"
+
+    def __init__(self):
+        # Database-backed runtime repository
+        self.repo = RuntimeRepository()
+
+    # ------------------------------------------------------------------
+    # Low-level Docker execution helpers
+    # ------------------------------------------------------------------
+
+    def _run(self, args: list[str]) -> str:
+        """
+        Execute a Docker CLI command synchronously.
+
+        Args:
+            args: List of Docker arguments (without 'docker')
+
+        Returns:
+            stdout output as string
+
+        Raises:
+            DockerError if command execution fails
+        """
+        try:
+            result = subprocess.run(
+                ["docker", *args],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return result.stdout.strip()
+        except subprocess.CalledProcessError as e:
+            raise DockerError(e.stderr.strip() or str(e))
+
+    async def _run_async(self, args: list[str]) -> str:
+        """
+        Execute a Docker CLI command asynchronously.
+
+        Docker operations are blocking; this offloads them
+        to a background thread to avoid blocking the event loop.
+        """
+        return await asyncio.to_thread(self._run, args)
+
+    # ------------------------------------------------------------------
+    # Docker state inspection
+    # ------------------------------------------------------------------
+
+    def container_exists(self, name: str) -> bool:
+        """
+        Check if a container exists (running or stopped).
+        """
+        return self._run(
+            ["ps", "-a", "--filter", f"name=^{name}$", "--format", "{{.Names}}"]
+        ) == name
+
+    def is_running(self, name: str) -> bool:
+        """
+        Check if a container is currently running.
+        """
+        return self._run(
+            ["ps", "--filter", f"name=^{name}$", "--format", "{{.Names}}"]
+        ) == name
+
+    # ------------------------------------------------------------------
+    # Container lifecycle operations
+    # ------------------------------------------------------------------
+
+    async def create_container(
+        self,
+        project_name: str,
+        image: Optional[str] = None,
+    ):
+        """
+        Create a Docker container for a project.
+
+        Behavior:
+        ---------
+        - Validates project directory exists
+        - Persists runtime metadata in DB
+        - Creates container in stopped state
+        - Container runs `sleep infinity` to stay alive
+
+        Notes:
+        ------
+        - Does NOT start the container
+        - Safe to call only once per project
+        """
+        project_dir = resolve_project_dir(project_name)
+        image = image or self.DEFAULT_IMAGE
+        container_name = f"ai_builder_{project_name}"
+
+        # Persist runtime metadata first (DB is source of truth)
+        await self.repo.create(
+            project_name=project_name,
+            project_root=str(project_dir),
+            image=image,
+            container_name=container_name,
+        )
+
+        # Create container (but do not start)
+        await self._run_async([
+            "create",
+            "--name", container_name,
+            "--memory", "2g",
+            "--cpus", "2.0",
+            "-w", self.WORKDIR,
+            "-v", f"{project_dir}:{self.WORKDIR}",
+            image,
+            "sleep", "infinity",
+        ])
+
+    async def start_container(self, project_name: str):
+        """
+        Start the Docker container for a project.
+
+        This operation is idempotent.
+        """
+        runtime = await self.repo.get(project_name)
+
+        if self.is_running(runtime.container_name):
+            return
+
+        await self._run_async(["start", runtime.container_name])
+        await self.repo.update_status(project_name, "running")
+
+    async def stop_container(self, project_name: str):
+        """
+        Stop the Docker container for a project.
+
+        This does NOT delete the container.
+        """
+        runtime = await self.repo.get(project_name)
+
+        if self.is_running(runtime.container_name):
+            await self._run_async(["stop", runtime.container_name])
+            await self.repo.update_status(project_name, "stopped")
+
+    async def remove_container(self, project_name: str):
+        """
+        Remove the Docker container and delete runtime metadata.
+
+        This is a destructive operation.
+        """
+        runtime = await self.repo.get(project_name)
+
+        if self.container_exists(runtime.container_name):
+            if self.is_running(runtime.container_name):
+                await self._run_async(["stop", runtime.container_name])
+            await self._run_async(["rm", runtime.container_name])
+
+        # Remove DB record last
+        await self.repo.delete(project_name)
+
+
+# Singleton instance used across the application
+docker_manager = DockerManager()
+
+
+docker manager
+
+
+"""
+Purpose:
+--------
+Reconciles persisted runtime state with actual Docker container state
+during application startup.
+
+Why this exists:
+----------------
+- Database is the source of truth for *known* runtimes
+- Docker is the source of truth for *actual* container state
+- Backend may crash or restart while containers are still running
+
+This reconciliation ensures:
+-----------------------------
+- DB status reflects real container state
+- UI receives correct runtime status after backend restart
+
+Execution:
+----------
+- Runs ONCE during application startup
+- Must NEVER crash application startup
+"""
+
+from agent_v1.runtime.docker_manager import docker_manager, DockerError
+from agent_v1.runtime.repository import RuntimeRepository
+
+
+async def reconcile_runtimes_on_startup():
+    """
+    Sync database runtime status with Docker container state.
+
+    Rules:
+    ------
+    - If container exists AND is running → status = "running"
+    - Otherwise → status = "stopped"
+    - Missing containers are treated as stopped
+    - Errors MUST NOT block app startup
+    """
+    repo = RuntimeRepository()
+
+    # Fetch all known runtimes from DB
+    runtimes = await repo.list_all()
+
+    for runtime in runtimes:
+        try:
+            # Check Docker state
+            exists = docker_manager.container_exists(
+                runtime.container_name
+            )
+
+            running = (
+                docker_manager.is_running(runtime.container_name)
+                if exists
+                else False
+            )
+
+            new_status = "running" if running else "stopped"
+
+            # Update DB only if state differs
+            if runtime.status != new_status:
+                await repo.update_status(
+                    runtime.project_name,
+                    new_status,
+                )
+
+        except DockerError as e:
+            # IMPORTANT:
+            # Docker errors must never prevent app startup.
+            # Log and continue safely.
+            print(
+                f"[RECONCILE_WARNING] "
+                f"project={runtime.project_name} "
+                f"error={e}"
+            )
+
+reconicle
+
+"""
+Purpose:
+--------
+Database access layer for container runtime state.
+
+Design Principles:
+------------------
+- Database is the single source of truth for *container lifecycle*
+- Backend tracks ONLY what it controls
+- Application processes are NOT tracked here
+
+What this repository manages:
+------------------------------
+- Container existence
+- Container running / stopped status
+- Container metadata (image, name, project root)
+- Last executed command (optional, informational)
+
+What this repository deliberately DOES NOT manage:
+--------------------------------------------------
+- Application process state (Flask, FastAPI, Streamlit, etc.)
+- Runtime logs
+- Terminal activity
+
+Rationale:
+----------
+Process execution is handled exclusively via WebSocket terminal.
+Tracking process state in DB would be inaccurate and misleading.
+"""
+
+from typing import List
+from tortoise.exceptions import DoesNotExist
+
+from agent_v1.api.db.models import ProjectRuntime
+
+
+class RuntimeNotFound(Exception):
+    """
+    Raised when a runtime entry does not exist in the database.
+    """
+    pass
+
+
+class RuntimeRepository:
+    """
+    Repository for ProjectRuntime persistence.
+
+    This class abstracts all database access for runtime state
+    and enforces a clean, container-only model.
+    """
+
+    # ------------------------------------------------------------------
+    # Create / Read
+    # ------------------------------------------------------------------
+
+    async def create(
+        self,
+        project_name: str,
+        project_root: str,
+        image: str,
+        container_name: str,
+    ) -> ProjectRuntime:
+        """
+        Create a new runtime entry for a project.
+
+        Containers are created in a STOPPED state by default.
+        """
+        return await ProjectRuntime.create(
+            project_name=project_name,
+            project_root=project_root,
+            image=image,
+            container_name=container_name,
+            status="stopped",
+        )
+
+    async def get(self, project_name: str) -> ProjectRuntime:
+        """
+        Fetch runtime metadata for a project.
+        """
+        try:
+            return await ProjectRuntime.get(project_name=project_name)
+        except DoesNotExist:
+            raise RuntimeNotFound(
+                f"No runtime found for project: {project_name}"
+            )
+
+    async def list_all(self) -> List[ProjectRuntime]:
+        """
+        List all known runtimes.
+        """
+        return await ProjectRuntime.all()
+
+    # ------------------------------------------------------------------
+    # Container lifecycle updates
+    # ------------------------------------------------------------------
+
+    async def update_status(self, project_name: str, status: str) -> None:
+        """
+        Update container status (running / stopped).
+        """
+        updated = await ProjectRuntime.filter(
+            project_name=project_name
+        ).update(status=status)
+
+        if not updated:
+            raise RuntimeNotFound(project_name)
+
+    async def update_last_command(
+        self,
+        project_name: str,
+        command: str,
+    ) -> None:
+        """
+        Persist the last executed command.
+
+        This is informational only and not used for state tracking.
+        """
+        updated = await ProjectRuntime.filter(
+            project_name=project_name
+        ).update(last_command=command)
+
+        if not updated:
+            raise RuntimeNotFound(project_name)
+
+    # ------------------------------------------------------------------
+    # Delete
+    # ------------------------------------------------------------------
+
+    async def delete(self, project_name: str) -> None:
+        """
+        Delete runtime metadata after container removal.
+        """
+        deleted = await ProjectRuntime.filter(
+            project_name=project_name
+        ).delete()
+
+        if not deleted:
+            raise RuntimeNotFound(project_name)
+
+
+reportistorypy
+
+
+"""
+Purpose:
+--------
+Provides interactive PTY-based terminal access to running containers.
+
+Designed for:
+- WebSocket streaming
+- xterm.js frontend
+
+Guarantees:
+- One terminal session per project
+- Continuous, low-latency streaming
+"""
+
+import os
+import pty
+import select
+import subprocess
+import threading
+from queue import Queue
+
+
+class TerminalSession:
+    def __init__(self, container_name: str, workdir: str):
+        self.container_name = container_name
+        self.workdir = workdir
+        self.master_fd = None
+        self.process = None
+        self.queue = Queue()
+        self.alive = True
+
+        self._start_shell()
+        self._start_reader()
+
+    def _start_shell(self):
+        self.master_fd, slave_fd = pty.openpty()
+
+        self.process = subprocess.Popen(
+            [
+                "docker", "exec", "-it",
+                "-w", self.workdir,
+                self.container_name,
+                "/bin/bash",
+            ],
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            close_fds=True,
+        )
+
+        os.close(slave_fd)
+
+    def _start_reader(self):
+        def reader():
+            while self.alive:
+                r, _, _ = select.select([self.master_fd], [], [], 0.1)
+                if self.master_fd in r:
+                    try:
+                        data = os.read(self.master_fd, 4096)
+                        if data:
+                            self.queue.put(data.decode(errors="ignore"))
+                    except OSError:
+                        break
+
+        threading.Thread(target=reader, daemon=True).start()
+
+    def write(self, data: str):
+        if self.alive:
+            os.write(self.master_fd, data.encode())
+
+    def read(self):
+        try:
+            return self.queue.get_nowait()
+        except Exception:
+            return None
+
+    def close(self):
+        self.alive = False
+        try:
+            self.process.terminate()
+        except Exception:
+            pass
+
+
+class TerminalManager:
+    def __init__(self):
+        self.sessions = {}
+
+    def get_or_create(self, project_name: str, container_name: str):
+        if project_name not in self.sessions:
+            self.sessions[project_name] = TerminalSession(
+                container_name=container_name,
+                workdir="/workspace",
+            )
+        return self.sessions[project_name]
+
+    def close(self, project_name: str):
+        session = self.sessions.pop(project_name, None)
+        if session:
+            session.close()
+
+
+terminal_manager = TerminalManager()
+
+
+term inal managert
+
+
+import pathlib
+import subprocess
+from typing import Tuple, Optional
+
+from langchain.tools import tool
+
+# Project Root Configuration
+_PROJECT_ROOT : Optional[pathlib.Path] = None
+
+def set_project_root(path: str):
+    global _PROJECT_ROOT
+    _PROJECT_ROOT = pathlib.Path(path).resolve()
+
+def get_project_root() -> pathlib.Path:
+    if _PROJECT_ROOT is None:
+        raise RuntimeError("Project root not initialized")
+    return _PROJECT_ROOT
+
+# Path Safety Utilities
+def safe_path_for_project(path: str) -> pathlib.Path:
+    if not path:
+        raise ValueError("Path cannot be empty")
+
+    root = get_project_root()
+    candidate = (root / path).resolve()
+
+    if candidate != root and root not in candidate.parents:
+        raise ValueError("Attempt to access outside project root")
+
+    return candidate
+
+# File System Tools
+@tool()
+def write_file(path: str, content: str) -> str:
+    """
+    Writes full content to a file within the project root.
+    Overwrites existing content.
+    """
+    p = safe_path_for_project(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(content)
+
+    return f"WROTE: {p.relative_to(get_project_root())}"
+
+@tool()
+def read_file(path: str) -> str:
+    """
+    Reads content from a file within the project root.
+    Returns empty string if file does not exist.
+    """
+    p = safe_path_for_project(path)
+
+    if not p.exists():
+        return ""
+
+    if not p.is_file():
+        return f"ERROR: {path} is not a file"
+
+    with open(p, "r", encoding="utf-8") as f:
+        return f.read()
+
+@tool()
+def list_files(directory: str = ".") -> str:
+    """
+    Recursively lists all files within a directory in the project root.
+    """
+    p = safe_path_for_project(directory)
+
+    if not p.exists():
+        return f"ERROR: Directory does not exist: {directory}"
+
+    if not p.is_dir():
+        return f"ERROR: {directory} is not a directory"
+
+    files = sorted(
+        str(f.relative_to(get_project_root()))
+        for f in p.glob("**/*")
+        if f.is_file()
+    )
+
+    return "\n".join(files) if files else "No files found"
+
+
+@tool()
+def get_current_directory() -> str:
+    """
+    Returns the project root directory path.
+    """
+    return str(get_project_root())
+
+# Shell Execution Tool
+@tool()
+def run_cmd(
+    cmd: str,
+    cwd: Optional[str] = None,
+    timeout: int = 30
+) -> Tuple[int, str, str]:
+    """
+    Executes a shell command inside the project root or subdirectory.
+
+    Returns:
+        (return_code, stdout, stderr)
+    """
+    if not cmd:
+        return 1, "", "ERROR: Command is empty"
+
+    try:
+        cwd_path = safe_path_for_project(cwd) if cwd else get_project_root()
+
+        result = subprocess.run(
+            cmd,
+            shell=True,
+            cwd=str(cwd_path),
+            capture_output=True,
+            text=True,
+            timeout=timeout
+        )
+
+        return (
+            result.returncode,
+            result.stdout.strip(),
+            result.stderr.strip()
+        )
+
+    except subprocess.TimeoutExpired:
+        return 1, "", "ERROR: Command timed out"
+
+    except Exception as e:
+        return 1, "", f"ERROR: {str(e)}"
+
+
+filesystem.py
+
+
+import pathlib
+import re
+from datetime import datetime
+
+PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[2]
+GENERATED_PROJECTS_ROOT = PROJECT_ROOT / "generated_projects"
+
+
+def slugify(name :str) -> str:
+    name = name.lower()
+    name = re.sub(r"[^a-z0-9]+", "_" , name)
+    return name.strip("_")
+
+def create_project_root(project_name: str) -> pathlib.Path:
+    GENERATED_PROJECTS_ROOT.mkdir(parents=True, exist_ok=True)
+
+    slug = slugify(project_name)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    project_dir = GENERATED_PROJECTS_ROOT / f"{slug}_{timestamp}"
+    project_dir.mkdir(parents=True, exist_ok=False)
+
+    return project_dir.resolve()
+
+
+
+
+project root.py
+
+
+import pathlib
+import subprocess
+from typing import Tuple, Optional
+import os
+# -------------------------------------------------------------------
+# Project Root Configuration (API)
+# -------------------------------------------------------------------
+
+_API_PROJECT_ROOT: Optional[pathlib.Path] = None
+
+
+def api_set_project_root(path: str):
+    """Set the project root directory for API filesystem operations."""
+    global _API_PROJECT_ROOT
+    _API_PROJECT_ROOT = pathlib.Path(path).resolve()
+
+
+def api_get_project_root() -> pathlib.Path:
+    """Return the current API project root."""
+    if _API_PROJECT_ROOT is None:
+        raise RuntimeError("Project root not initialized")
+    return _API_PROJECT_ROOT
+
+
+# -------------------------------------------------------------------
+# Path Safety Utilities (API)
+# -------------------------------------------------------------------
+
+def api_safe_path_for_project(path: str) -> pathlib.Path:
+    """Ensure path stays within API project root."""
+    if not path:
+        raise ValueError("Path cannot be empty")
+
+    root = api_get_project_root()
+    candidate = (root / path).resolve()
+
+    if candidate != root and root not in candidate.parents:
+        raise ValueError("Attempt to access outside project root")
+
+    return candidate
+
+
+
+# -------------------------------------------------------------------
+# File Operations (API)
+# -------------------------------------------------------------------
+
+# def api_write_file(path: str, content: str) -> str:
+#     """Create or overwrite a file within the project root."""
+#     p = api_safe_path_for_project(path)
+#     p.parent.mkdir(parents=True, exist_ok=True)
+#
+#     with open(p, "w", encoding="utf-8") as f:
+#         f.write(content)
+#
+#     return f"WROTE: {p.relative_to(api_get_project_root())}"
+
+def api_write_file(path: str, content: str) -> str:
+    p = api_safe_path_for_project(path)
+
+    # Ensure parent directories exist
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+    # FIX PERMISSIONS IF FILE EXISTS
+    if p.exists():
+        try:
+            os.chmod(p, 0o666)
+        except PermissionError:
+            pass
+
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(content)
+
+    return f"WROTE: {p.relative_to(api_get_project_root())}"
+
+
+def api_read_file(path: str) -> str:
+    """Read file content within the project root."""
+    p = api_safe_path_for_project(path)
+
+    if not p.exists():
+        return ""
+
+    if not p.is_file():
+        return f"ERROR: {path} is not a file"
+
+    with open(p, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def api_delete_file(path: str) -> str:
+    """Delete a file within the project root."""
+    p = api_safe_path_for_project(path)
+
+    if not p.exists():
+        return "ERROR: File does not exist"
+
+    if not p.is_file():
+        return f"ERROR: {path} is not a file"
+
+    p.unlink()
+    return f"DELETED_FILE: {path}"
+
+
+# -------------------------------------------------------------------
+# Folder Operations (API)
+# -------------------------------------------------------------------
+
+def api_create_folder(path: str) -> str:
+    """Create a folder within the project root."""
+    p = api_safe_path_for_project(path)
+    p.mkdir(parents=True, exist_ok=True)
+    return f"CREATED_FOLDER: {path}"
+
+
+def api_delete_folder(path: str) -> str:
+    """Recursively delete a folder within the project root."""
+    p = api_safe_path_for_project(path)
+
+    if not p.exists():
+        return "ERROR: Folder does not exist"
+
+    if not p.is_dir():
+        return f"ERROR: {path} is not a directory"
+
+    for item in sorted(p.glob("**/*"), reverse=True):
+        if item.is_file():
+            item.unlink()
+        elif item.is_dir():
+            item.rmdir()
+
+    p.rmdir()
+    return f"DELETED_FOLDER: {path}"
+
+
+# -------------------------------------------------------------------
+# Listing (API)
+# -------------------------------------------------------------------
+
+def api_list_files(directory: str = ".") -> str:
+    """Recursively list all files inside a directory."""
+    p = api_safe_path_for_project(directory)
+
+    if not p.exists():
+        return f"ERROR: Directory does not exist: {directory}"
+
+    if not p.is_dir():
+        return f"ERROR: {directory} is not a directory"
+
+    files = sorted(
+        str(f.relative_to(api_get_project_root()))
+        for f in p.glob("**/*")
+        if f.is_file()
+    )
+
+    return "\n".join(files) if files else "No files found"
+
+
+def api_get_current_directory() -> str:
+    """Return project root path."""
+    return str(api_get_project_root())
+
+
+utils.py
+
+
+
+this is my entire prohect code
+

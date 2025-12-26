@@ -3,35 +3,38 @@ Purpose:
 --------
 HTTP + WebSocket API for runtime management.
 
-Design Philosophy:
-------------------
-- Backend manages ONLY Docker container lifecycle.
-- Application processes (Flask / FastAPI / Streamlit / agents)
-  are user-controlled via WebSocket terminal.
-- No backend-level process state is tracked.
-
-Exposes:
+Security:
 ---------
-- Start container
-- Stop container
-- Delete container
-- Get container runtime status
-- WebSocket terminal (xterm.js)
+- JWT protected
+- Project ownership enforced
+- Runtime actions rate-limited
 """
 
-from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 import asyncio
-from pydantic import BaseModel
 from typing import Optional
+
+from fastapi import (
+    APIRouter,
+    HTTPException,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+    Depends,
+)
+from pydantic import BaseModel
+
+from agent_v1.api.auth.dependencies import AuthDependency
+from agent_v1.api.auth.rate_limits import runtime_operation_limit
+from agent_v1.api.guards import ensure_project_access
+from agent_v1.core.jwt_manager import JWTManager
 
 from agent_v1.runtime.docker_manager import docker_manager, DockerError
 from agent_v1.runtime.repository import RuntimeRepository, RuntimeNotFound
 from agent_v1.runtime.terminal_manager import terminal_manager
-from agent_v1.api.project_utils import resolve_project_dir
+from agent_v1.api.db.models import User
 
 router = APIRouter(prefix="/projects", tags=["runtime"])
 repo = RuntimeRepository()
-
 
 # -------------------------------------------------------------------
 # Response Models
@@ -55,77 +58,77 @@ class RuntimeStatusResponse(BaseModel):
 # Container Lifecycle
 # -------------------------------------------------------------------
 
-@router.post("/{project_name}/runtime/start", response_model=StartRuntimeResponse)
-async def start_runtime(project_name: str):
-    """
-    Create (if needed) and start the Docker container for a project.
+@router.post(
+    "/{project_name}/runtime/start",
+    response_model=StartRuntimeResponse,
+    dependencies=[Depends(runtime_operation_limit)],
+)
+async def start_runtime(
+    project_name: str,
+    user: AuthDependency.current_user,
+):
+    project = await ensure_project_access(project_name, user)
 
-    Behavior:
-    - Validates project exists on disk
-    - Creates container + DB record if missing
-    - Starts container (idempotent)
-    """
     try:
-        resolve_project_dir(project_name)
-
         try:
-            runtime = await repo.get(project_name)
+            await repo.get(project.name)
         except RuntimeNotFound:
-            await docker_manager.create_container(project_name)
-            runtime = await repo.get(project_name)
+            await docker_manager.create_container(project.name)
 
-        await docker_manager.start_container(project_name)
-        runtime = await repo.get(project_name)
+        await docker_manager.start_container(project.name)
+        runtime = await repo.get(project.name)
 
         return StartRuntimeResponse(
-            project_name=runtime.project_name,
+            project_name=runtime.project.name,  # ✅ FIX
             status=runtime.status,
             container_id=runtime.container_name,
             image=runtime.image,
         )
 
-    except FileNotFoundError:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Project not found: {project_name}",
-        )
     except DockerError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e),
+        )
 
 
-@router.get("/{project_name}/runtime/status", response_model=RuntimeStatusResponse)
-async def runtime_status(project_name: str):
-    """
-    Returns the current container runtime status.
+@router.get(
+    "/{project_name}/runtime/status",
+    response_model=RuntimeStatusResponse,
+    dependencies=[Depends(runtime_operation_limit)],
+)
+async def runtime_status(
+    project_name: str,
+    user: AuthDependency.current_user,
+):
+    await ensure_project_access(project_name, user)
 
-    This is the single source of truth for the UI.
-    """
     try:
-        r = await repo.get(project_name)
-
+        runtime = await repo.get(project_name)
         return RuntimeStatusResponse(
-            project_name=r.project_name,
-            container_status=r.status,
-            container_id=r.container_name,
-            image=r.image,
+            project_name=runtime.project.name,  # ✅ FIX
+            container_status=runtime.status,
+            container_id=runtime.container_name,
+            image=runtime.image,
         )
 
     except RuntimeNotFound:
         raise HTTPException(
-            status_code=404,
-            detail=f"No runtime found for project: {project_name}",
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Runtime not found",
         )
 
 
-@router.post("/{project_name}/runtime/stop")
-async def stop_runtime(project_name: str):
-    """
-    Stop the Docker container.
+@router.post(
+    "/{project_name}/runtime/stop",
+    dependencies=[Depends(runtime_operation_limit)],
+)
+async def stop_runtime(
+    project_name: str,
+    user: AuthDependency.current_user,
+):
+    await ensure_project_access(project_name, user)
 
-    Notes:
-    - Safe to call even if container is already stopped
-    - Terminal session (if any) will be closed automatically
-    """
     try:
         await docker_manager.stop_container(project_name)
         terminal_manager.close(project_name)
@@ -133,18 +136,21 @@ async def stop_runtime(project_name: str):
 
     except RuntimeNotFound:
         raise HTTPException(
-            status_code=404,
-            detail=f"No runtime found for project: {project_name}",
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Runtime not found",
         )
 
 
-@router.delete("/{project_name}/runtime")
-async def delete_runtime(project_name: str):
-    """
-    Remove the Docker container and delete the runtime record.
+@router.delete(
+    "/{project_name}/runtime",
+    dependencies=[Depends(runtime_operation_limit)],
+)
+async def delete_runtime(
+    project_name: str,
+    user: AuthDependency.current_user,
+):
+    await ensure_project_access(project_name, user)
 
-    This is a destructive operation.
-    """
     try:
         terminal_manager.close(project_name)
         await docker_manager.remove_container(project_name)
@@ -152,22 +158,48 @@ async def delete_runtime(project_name: str):
 
     except RuntimeNotFound:
         raise HTTPException(
-            status_code=404,
-            detail=f"No runtime found for project: {project_name}",
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Runtime not found",
         )
-
 
 # -------------------------------------------------------------------
 # WebSocket Terminal
 # -------------------------------------------------------------------
-@router.websocket("/{project_name}/runtime/ws/terminal")
-async def runtime_terminal_ws(websocket: WebSocket, project_name: str):
-    await websocket.accept()
 
-    runtime = await repo.get(project_name)
-    if runtime.status != "running":
-        await websocket.send_text("Container not running")
-        return  # FastAPI will close socket
+@router.websocket("/{project_name}/runtime/ws/terminal")
+async def runtime_terminal_ws(
+    websocket: WebSocket,
+    project_name: str,
+):
+    token = websocket.query_params.get("token")
+    if not token:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    try:
+        payload = JWTManager.decode_token(token)
+        if payload.get("token_type") != "access":
+            raise ValueError("Invalid token type")
+
+        user = await User.get_or_none(
+            id=payload["sub"],
+            is_active=True,
+        )
+        if not user:
+            raise ValueError("Invalid user")
+
+        await ensure_project_access(project_name, user)
+
+        runtime = await repo.get(project_name)
+        if runtime.status != "running":
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+
+    except Exception:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    await websocket.accept()
 
     session = terminal_manager.get_or_create(
         project_name,
@@ -175,11 +207,14 @@ async def runtime_terminal_ws(websocket: WebSocket, project_name: str):
     )
 
     async def push_output():
-        while True:
-            data = session.read()
-            if data:
-                await websocket.send_text(data)
-            await asyncio.sleep(0.01)
+        try:
+            while True:
+                data = session.read()
+                if data:
+                    await websocket.send_text(data)
+                await asyncio.sleep(0.01)
+        except asyncio.CancelledError:
+            pass
 
     task = asyncio.create_task(push_output())
 
@@ -187,10 +222,8 @@ async def runtime_terminal_ws(websocket: WebSocket, project_name: str):
         while True:
             msg = await websocket.receive_text()
             session.write(msg)
-
     except WebSocketDisconnect:
         pass
-
     finally:
-        terminal_manager.close(project_name)
         task.cancel()
+        terminal_manager.close(project_name)

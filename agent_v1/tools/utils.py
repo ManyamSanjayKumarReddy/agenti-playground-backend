@@ -2,6 +2,8 @@ import pathlib
 import subprocess
 from typing import Tuple, Optional
 import os
+from datetime import datetime, timezone
+
 # -------------------------------------------------------------------
 # Project Root Configuration (API)
 # -------------------------------------------------------------------
@@ -160,3 +162,6 @@ def api_get_current_directory() -> str:
     """Return project root path."""
     return str(api_get_project_root())
 
+
+def get_current_utc():
+    return datetime.now(timezone.utc)

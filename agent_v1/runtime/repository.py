@@ -27,17 +27,15 @@ Rationale:
 Process execution is handled exclusively via WebSocket terminal.
 Tracking process state in DB would be inaccurate and misleading.
 """
+# agent_v1/runtime/repository.py
 
 from typing import List
 from tortoise.exceptions import DoesNotExist
 
-from agent_v1.api.db.models import ProjectRuntime
+from agent_v1.api.db.models import Project, ProjectRuntime
 
 
 class RuntimeNotFound(Exception):
-    """
-    Raised when a runtime entry does not exist in the database.
-    """
     pass
 
 
@@ -45,9 +43,19 @@ class RuntimeRepository:
     """
     Repository for ProjectRuntime persistence.
 
-    This class abstracts all database access for runtime state
-    and enforces a clean, container-only model.
+    - Uses Project → Runtime FK relationship
+    - One runtime per project
     """
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    async def _get_project(self, project_name: str) -> Project:
+        project = await Project.get_or_none(name=project_name)
+        if not project:
+            raise DoesNotExist(f"Project not found: {project_name}")
+        return project
 
     # ------------------------------------------------------------------
     # Create / Read
@@ -60,13 +68,10 @@ class RuntimeRepository:
         image: str,
         container_name: str,
     ) -> ProjectRuntime:
-        """
-        Create a new runtime entry for a project.
+        project = await self._get_project(project_name)
 
-        Containers are created in a STOPPED state by default.
-        """
         return await ProjectRuntime.create(
-            project_name=project_name,
+            project=project,
             project_root=project_root,
             image=image,
             container_name=container_name,
@@ -74,33 +79,31 @@ class RuntimeRepository:
         )
 
     async def get(self, project_name: str) -> ProjectRuntime:
-        """
-        Fetch runtime metadata for a project.
-        """
-        try:
-            return await ProjectRuntime.get(project_name=project_name)
-        except DoesNotExist:
-            raise RuntimeNotFound(
-                f"No runtime found for project: {project_name}"
-            )
+        project = await self._get_project(project_name)
+
+        runtime = (
+            await ProjectRuntime.get_or_none(project=project)
+            .select_related("project")
+        )
+
+        if not runtime:
+            raise RuntimeNotFound(project_name)
+
+        return runtime
 
     async def list_all(self) -> List[ProjectRuntime]:
-        """
-        List all known runtimes.
-        """
-        return await ProjectRuntime.all()
+        return await ProjectRuntime.all().select_related("project")
 
     # ------------------------------------------------------------------
     # Container lifecycle updates
     # ------------------------------------------------------------------
 
     async def update_status(self, project_name: str, status: str) -> None:
-        """
-        Update container status (running / stopped).
-        """
-        updated = await ProjectRuntime.filter(
-            project_name=project_name
-        ).update(status=status)
+        project = await self._get_project(project_name)
+
+        updated = await ProjectRuntime.filter(project=project).update(
+            status=status
+        )
 
         if not updated:
             raise RuntimeNotFound(project_name)
@@ -110,14 +113,11 @@ class RuntimeRepository:
         project_name: str,
         command: str,
     ) -> None:
-        """
-        Persist the last executed command.
+        project = await self._get_project(project_name)
 
-        This is informational only and not used for state tracking.
-        """
-        updated = await ProjectRuntime.filter(
-            project_name=project_name
-        ).update(last_command=command)
+        updated = await ProjectRuntime.filter(project=project).update(
+            last_command=command
+        )
 
         if not updated:
             raise RuntimeNotFound(project_name)
@@ -127,12 +127,9 @@ class RuntimeRepository:
     # ------------------------------------------------------------------
 
     async def delete(self, project_name: str) -> None:
-        """
-        Delete runtime metadata after container removal.
-        """
-        deleted = await ProjectRuntime.filter(
-            project_name=project_name
-        ).delete()
+        project = await self._get_project(project_name)
+
+        deleted = await ProjectRuntime.filter(project=project).delete()
 
         if not deleted:
             raise RuntimeNotFound(project_name)

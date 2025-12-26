@@ -28,16 +28,12 @@ import asyncio
 from typing import Optional
 
 from agent_v1.api.project_utils import resolve_project_dir
-from agent_v1.runtime.repository import RuntimeRepository
+from agent_v1.runtime.repository import RuntimeRepository, RuntimeNotFound
+from agent_v1.api.db.models import Project
 
 
 class DockerError(Exception):
-    """
-    Raised when a Docker CLI operation fails.
-
-    This exception should be caught at the API layer
-    and translated into an HTTP error response.
-    """
+    """Raised when a Docker CLI operation fails."""
     pass
 
 
@@ -45,34 +41,21 @@ class DockerManager:
     """
     Docker container lifecycle manager.
 
-    One Docker container is created per project and kept
-    alive using a long-running `sleep infinity` process.
+    One container per project.
+    Containers stay alive using `sleep infinity`.
     """
 
     DEFAULT_IMAGE = "python:3.11-slim"
     WORKDIR = "/workspace"
 
     def __init__(self):
-        # Database-backed runtime repository
         self.repo = RuntimeRepository()
 
     # ------------------------------------------------------------------
-    # Low-level Docker execution helpers
+    # Docker execution helpers
     # ------------------------------------------------------------------
 
     def _run(self, args: list[str]) -> str:
-        """
-        Execute a Docker CLI command synchronously.
-
-        Args:
-            args: List of Docker arguments (without 'docker')
-
-        Returns:
-            stdout output as string
-
-        Raises:
-            DockerError if command execution fails
-        """
         try:
             result = subprocess.run(
                 ["docker", *args],
@@ -85,12 +68,6 @@ class DockerManager:
             raise DockerError(e.stderr.strip() or str(e))
 
     async def _run_async(self, args: list[str]) -> str:
-        """
-        Execute a Docker CLI command asynchronously.
-
-        Docker operations are blocking; this offloads them
-        to a background thread to avoid blocking the event loop.
-        """
         return await asyncio.to_thread(self._run, args)
 
     # ------------------------------------------------------------------
@@ -98,23 +75,23 @@ class DockerManager:
     # ------------------------------------------------------------------
 
     def container_exists(self, name: str) -> bool:
-        """
-        Check if a container exists (running or stopped).
-        """
-        return self._run(
-            ["ps", "-a", "--filter", f"name=^{name}$", "--format", "{{.Names}}"]
-        ) == name
+        return (
+            self._run(
+                ["ps", "-a", "--filter", f"name=^{name}$", "--format", "{{.Names}}"]
+            )
+            == name
+        )
 
     def is_running(self, name: str) -> bool:
-        """
-        Check if a container is currently running.
-        """
-        return self._run(
-            ["ps", "--filter", f"name=^{name}$", "--format", "{{.Names}}"]
-        ) == name
+        return (
+            self._run(
+                ["ps", "--filter", f"name=^{name}$", "--format", "{{.Names}}"]
+            )
+            == name
+        )
 
     # ------------------------------------------------------------------
-    # Container lifecycle operations
+    # Container lifecycle
     # ------------------------------------------------------------------
 
     async def create_container(
@@ -125,23 +102,30 @@ class DockerManager:
         """
         Create a Docker container for a project.
 
-        Behavior:
-        ---------
+        - Validates project exists in DB
         - Validates project directory exists
-        - Persists runtime metadata in DB
+        - Persists runtime metadata
         - Creates container in stopped state
-        - Container runs `sleep infinity` to stay alive
-
-        Notes:
-        ------
-        - Does NOT start the container
-        - Safe to call only once per project
         """
+        # 1️⃣ Validate project exists (DB is authority)
+        project = await Project.get_or_none(name=project_name)
+        if not project:
+            raise DockerError(f"Project does not exist: {project_name}")
+
+        # 2️⃣ Validate filesystem
         project_dir = resolve_project_dir(project_name)
+
         image = image or self.DEFAULT_IMAGE
         container_name = f"ai_builder_{project_name}"
 
-        # Persist runtime metadata first (DB is source of truth)
+        # 3️⃣ Prevent duplicate runtime creation
+        try:
+            await self.repo.get(project_name)
+            raise DockerError("Runtime already exists for this project")
+        except RuntimeNotFound:
+            pass
+
+        # 4️⃣ Persist runtime metadata FIRST
         await self.repo.create(
             project_name=project_name,
             project_root=str(project_dir),
@@ -149,23 +133,23 @@ class DockerManager:
             container_name=container_name,
         )
 
-        # Create container (but do not start)
-        await self._run_async([
-            "create",
-            "--name", container_name,
-            "--memory", "2g",
-            "--cpus", "2.0",
-            "-w", self.WORKDIR,
-            "-v", f"{project_dir}:{self.WORKDIR}",
-            image,
-            "sleep", "infinity",
-        ])
+        # 5️⃣ Create container (stopped)
+        await self._run_async(
+            [
+                "create",
+                "--name", container_name,
+                "--memory", "2g",
+                "--cpus", "2.0",
+                "-w", self.WORKDIR,
+                "-v", f"{project_dir}:{self.WORKDIR}",
+                image,
+                "sleep", "infinity",
+            ]
+        )
 
     async def start_container(self, project_name: str):
         """
-        Start the Docker container for a project.
-
-        This operation is idempotent.
+        Start the Docker container (idempotent).
         """
         runtime = await self.repo.get(project_name)
 
@@ -177,9 +161,7 @@ class DockerManager:
 
     async def stop_container(self, project_name: str):
         """
-        Stop the Docker container for a project.
-
-        This does NOT delete the container.
+        Stop the Docker container.
         """
         runtime = await self.repo.get(project_name)
 
@@ -190,14 +172,13 @@ class DockerManager:
     async def remove_container(self, project_name: str):
         """
         Remove the Docker container and delete runtime metadata.
-
-        This is a destructive operation.
         """
         runtime = await self.repo.get(project_name)
 
         if self.container_exists(runtime.container_name):
             if self.is_running(runtime.container_name):
                 await self._run_async(["stop", runtime.container_name])
+
             await self._run_async(["rm", runtime.container_name])
 
         # Remove DB record last

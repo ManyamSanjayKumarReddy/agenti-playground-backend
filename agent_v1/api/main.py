@@ -1,19 +1,20 @@
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException, Body, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from fastapi.responses import JSONResponse
+import asyncio
 
 from tortoise import Tortoise
+from tortoise.exceptions import IntegrityError
 
 from agent_v1.graph.graph import run_agent
-from agent_v1.api.schemas import (
+from agent_v1.api.schemas.graph import (
     GenerateProjectRequest,
     GenerateProjectResponse,
     ListFilesResponse,
     ReadFileResponse,
     WriteFileRequest,
 )
-from agent_v1.api.project_utils import resolve_project_dir, GENERATED_PROJECTS_ROOT
 
 from agent_v1.tools.utils import (
     api_set_project_root,
@@ -26,13 +27,25 @@ from agent_v1.tools.utils import (
 )
 
 from agent_v1.api.runtime_routes import router as runtime_router
+from agent_v1.api.user_management_routes import router as management_router
+from agent_v1.api.auth.routes import router as auth_router
+
+from agent_v1.api.auth.dependencies import AuthDependency
+from agent_v1.api.db.models import Project
+from agent_v1.api.guards import ensure_project_access
+
+from agent_v1.api.auth.rate_limits import (
+    project_generation_limit,
+    file_ops_limit,
+)
+
 from agent_v1.api.db.config import init_db
 from agent_v1.runtime.reconcile import reconcile_runtimes_on_startup
 from agent_v1.runtime.terminal_manager import terminal_manager
 from agent_v1.core.logging import setup_logging
 from agent_v1.core.middleware import request_id_middleware
 from agent_v1.runtime.command_policy import CommandRejected
-from agent_v1.api.admin_routes import router as admin_router
+from agent_v1.api.stats_routes import router as stats_router
 
 # -------------------------------------------------------------------
 # Logging
@@ -41,7 +54,7 @@ from agent_v1.api.admin_routes import router as admin_router
 setup_logging()
 
 # -------------------------------------------------------------------
-# Application Lifespan
+# Lifespan
 # -------------------------------------------------------------------
 
 @asynccontextmanager
@@ -68,7 +81,10 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:3000",
+        "https://code-seed-box.lovable.app",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -80,8 +96,10 @@ app.middleware("http")(request_id_middleware)
 # Routers
 # -------------------------------------------------------------------
 
+app.include_router(auth_router)
 app.include_router(runtime_router)
-app.include_router(admin_router)
+app.include_router(management_router)
+app.include_router(stats_router)
 
 
 # -------------------------------------------------------------------
@@ -91,6 +109,7 @@ app.include_router(admin_router)
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
 
 @app.get("/ready")
 async def ready():
@@ -105,25 +124,50 @@ async def ready():
 # -------------------------------------------------------------------
 
 @app.get("/projects", response_model=list[str])
-def list_projects():
-    if not GENERATED_PROJECTS_ROOT.exists():
-        return []
-
-    return sorted(
-        p.name for p in GENERATED_PROJECTS_ROOT.iterdir() if p.is_dir()
+async def list_projects(
+    user=Depends(AuthDependency.get_current_user),
+):
+    projects = (
+        await Project.all()
+        if user.is_admin
+        else await Project.filter(owner=user)
     )
+    return sorted(p.name for p in projects)
 
 
-@app.post("/projects/generate", response_model=GenerateProjectResponse)
-def generate_project(req: GenerateProjectRequest):
-    result = run_agent(req.prompt)
+@app.post(
+    "/projects/generate",
+    response_model=GenerateProjectResponse,
+    dependencies=[Depends(project_generation_limit)],
+)
+async def generate_project(
+    req: GenerateProjectRequest,
+    user=Depends(AuthDependency.get_current_user),
+):
+    # ⚠️ Heavy operation → off event loop
+    result = await asyncio.to_thread(run_agent, req.prompt)
 
     coder_state = result.get("coder_state")
     if not coder_state:
-        raise HTTPException(status_code=500, detail="Project generation failed")
+        raise HTTPException(
+            status_code=500,
+            detail="Project generation failed",
+        )
 
     project_root = coder_state.project_root
     project_name = project_root.split("/")[-1]
+
+    try:
+        await Project.create(
+            name=project_name,
+            project_root=project_root,
+            owner=user,
+        )
+    except IntegrityError:
+        raise HTTPException(
+            status_code=409,
+            detail="Project with the same name already exists",
+        )
 
     return GenerateProjectResponse(
         project_name=project_name,
@@ -137,17 +181,17 @@ def generate_project(req: GenerateProjectRequest):
 @app.get(
     "/projects/{project_name}/files",
     response_model=ListFilesResponse,
+    dependencies=[Depends(file_ops_limit)],
 )
-def list_project_files(project_name: str):
-    project_dir = resolve_project_dir(project_name)
-    api_set_project_root(str(project_dir))
+async def list_project_files(
+    project_name: str,
+    user=Depends(AuthDependency.get_current_user),
+):
+    project = await ensure_project_access(project_name, user)
+    api_set_project_root(project.project_root)
 
     output = api_list_files(".")
-    files = (
-        output.split("\n")
-        if output and "No files found" not in output
-        else []
-    )
+    files = output.split("\n") if output and "No files found" not in output else []
 
     return ListFilesResponse(
         project_name=project_name,
@@ -158,10 +202,15 @@ def list_project_files(project_name: str):
 @app.get(
     "/projects/{project_name}/files/read",
     response_model=ReadFileResponse,
+    dependencies=[Depends(file_ops_limit)],
 )
-def read_project_file(project_name: str, file_path: str):
-    project_dir = resolve_project_dir(project_name)
-    api_set_project_root(str(project_dir))
+async def read_project_file(
+    project_name: str,
+    file_path: str = Query(..., description="Relative file path"),
+    user=Depends(AuthDependency.get_current_user),
+):
+    project = await ensure_project_access(project_name, user)
+    api_set_project_root(project.project_root)
 
     content = api_read_file(file_path)
     if content.startswith("ERROR"):
@@ -174,27 +223,37 @@ def read_project_file(project_name: str, file_path: str):
     )
 
 
-@app.post("/projects/{project_name}/files/write")
-def write_project_file(
+@app.post(
+    "/projects/{project_name}/files/write",
+    dependencies=[Depends(file_ops_limit)],
+)
+async def write_project_file(
     project_name: str,
-    file_path: str,
+    file_path: str = Query(..., description="Relative file path"),
     payload: WriteFileRequest = Body(...),
+    user=Depends(AuthDependency.get_current_user),
 ):
-    project_dir = resolve_project_dir(project_name)
-    api_set_project_root(str(project_dir))
+    project = await ensure_project_access(project_name, user)
+    api_set_project_root(project.project_root)
 
-    result = api_write_file(
-        path=file_path,
-        content=payload.content,
-    )
+    result = api_write_file(file_path, payload.content)
+    if result.startswith("ERROR"):
+        raise HTTPException(status_code=400, detail=result)
 
     return {"result": result}
 
 
-@app.delete("/projects/{project_name}/files/delete")
-def delete_project_file(project_name: str, file_path: str):
-    project_dir = resolve_project_dir(project_name)
-    api_set_project_root(str(project_dir))
+@app.delete(
+    "/projects/{project_name}/files/delete",
+    dependencies=[Depends(file_ops_limit)],
+)
+async def delete_project_file(
+    project_name: str,
+    file_path: str = Query(..., description="Relative file path"),
+    user=Depends(AuthDependency.get_current_user),
+):
+    project = await ensure_project_access(project_name, user)
+    api_set_project_root(project.project_root)
 
     result = api_delete_file(file_path)
     if result.startswith("ERROR"):
@@ -206,18 +265,36 @@ def delete_project_file(project_name: str, file_path: str):
 # Folders
 # -------------------------------------------------------------------
 
-@app.post("/projects/{project_name}/folders/create")
-def create_project_folder(project_name: str, folder_path: str):
-    project_dir = resolve_project_dir(project_name)
-    api_set_project_root(str(project_dir))
+@app.post(
+    "/projects/{project_name}/folders/create",
+    dependencies=[Depends(file_ops_limit)],
+)
+async def create_project_folder(
+    project_name: str,
+    folder_path: str = Query(..., description="Relative folder path"),
+    user=Depends(AuthDependency.get_current_user),
+):
+    project = await ensure_project_access(project_name, user)
+    api_set_project_root(project.project_root)
 
-    return {"result": api_create_folder(folder_path)}
+    result = api_create_folder(folder_path)
+    if result.startswith("ERROR"):
+        raise HTTPException(status_code=400, detail=result)
+
+    return {"result": result}
 
 
-@app.delete("/projects/{project_name}/folders/delete")
-def delete_project_folder(project_name: str, folder_path: str):
-    project_dir = resolve_project_dir(project_name)
-    api_set_project_root(str(project_dir))
+@app.delete(
+    "/projects/{project_name}/folders/delete",
+    dependencies=[Depends(file_ops_limit)],
+)
+async def delete_project_folder(
+    project_name: str,
+    folder_path: str = Query(..., description="Relative folder path"),
+    user=Depends(AuthDependency.get_current_user),
+):
+    project = await ensure_project_access(project_name, user)
+    api_set_project_root(project.project_root)
 
     result = api_delete_folder(folder_path)
     if result.startswith("ERROR"):
@@ -226,7 +303,7 @@ def delete_project_folder(project_name: str, folder_path: str):
     return {"result": result}
 
 # -------------------------------------------------------------------
-# Exception Handling
+# Exceptions
 # -------------------------------------------------------------------
 
 @app.exception_handler(CommandRejected)
