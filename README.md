@@ -1,5 +1,58 @@
 # AI Project Builder – Runtime & Agentic Execution Platform
 
+## Quick Start
+
+### Prerequisites
+- Python 3.11+
+- PostgreSQL 13+ (running)
+- Docker
+- [uv](https://github.com/astral-sh/uv) package manager
+
+### Setup PostgreSQL with Docker
+```bash
+# Start PostgreSQL container
+docker run -d \
+  --name app-builder-postgres \
+  -e POSTGRES_USER=app_user \
+  -e POSTGRES_PASSWORD=app_password \
+  -e POSTGRES_DB=app_builder_db \
+  -p 5432:5432 \
+  postgres:latest
+
+# Verify it's running
+docker ps | grep app-builder-postgres
+```
+
+Update your `.env` file:
+```
+DATABASE_URL=postgresql+asyncpg://app_user:app_password@localhost:5432/app_builder_db
+```
+
+### Setup
+```bash
+# Clone and navigate to project
+cd /home/sanjay/Documents/ai-projects/app-builder
+
+# Sync dependencies with uv
+uv sync
+
+# Activate virtual environment
+source .venv/bin/activate
+
+# Configure environment (create .env with DB credentials)
+# DATABASE_URL=postgresql+asyncpg://user:pass@localhost/app_builder_db
+
+# Initialize database
+aerich upgrade
+
+# Start the server
+uvicorn agent_v1.api.main:app --reload
+```
+
+Access the API at **http://localhost:8000/docs**
+
+---
+
 ## Overview
 
 AI Project Builder is an **agentic, backend-first execution platform** designed to:
