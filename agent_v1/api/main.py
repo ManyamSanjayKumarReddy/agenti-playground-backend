@@ -84,6 +84,8 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "https://code-seed-box.lovable.app",
+        "http://localhost:8080",
+        "https://dev-agentichub.theskilledguru.com"
     ],
     allow_credentials=True,
     allow_methods=["*"],
