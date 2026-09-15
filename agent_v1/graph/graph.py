@@ -5,11 +5,10 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph
 from langgraph.constants import END
-from langchain.agents import create_agent
 
-from agent_v1.graph.states import File, Plan, TaskPlan, CoderState
+from agent_v1.graph.states import File, Plan, TaskPlan, CoderState, FileContent
 from agent_v1.prompts.prompts import planner_prompt, architect_prompt, coder_system_prompt
-from agent_v1.tools.filesystem import read_file, write_file, list_files, get_current_directory, set_project_root
+from agent_v1.tools.filesystem import read_file, write_file, set_project_root
 from agent_v1.tools.project_root import create_project_root
 
 # Environment & LLM Setup
@@ -73,7 +72,15 @@ def architect_agent(state: Dict[str, Any]) -> Dict[str, Any]:
 
 def coder_agent(state: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Iterative tool-using coding agent.
+    Single-action-per-step coding agent.
+
+    Deliberately does NOT use tool-calling / bound tools: some
+    OpenAI-compatible gateways (self-hosted vLLM serving gpt-oss, in
+    particular) don't reliably support multi-turn function-calling yet.
+    Structured output (used here, same as planner/architect) doesn't hit
+    that code path and has been reliable in practice, so this step reads
+    the existing file itself, asks the model only for the new content,
+    and writes it itself - the model never needs to invoke anything.
     """
     llm = get_llm()
 
@@ -106,25 +113,20 @@ def coder_agent(state: Dict[str, Any]) -> Dict[str, Any]:
         f"Task: {current_task.task_description}\n"
         f"File: {current_task.filepath}\n\n"
         f"Existing Content:\n{existing_content}\n\n"
-        "Use write_file(path, content) to save your changes."
+        "Respond with the complete file content."
     )
 
-    tools = [
-        read_file,
-        write_file,
-        list_files,
-        get_current_directory,
-    ]
-
-    agent = create_agent(
-        model=llm,
-        tools=tools,
-        system_prompt=system_prompt
+    result = llm.with_structured_output(FileContent).invoke(
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
     )
 
-    agent.invoke(
-        {"messages": [{"role": "user", "content": user_prompt}]}
-    )
+    if not result:
+        raise ValueError("Coder agent returned empty output")
+
+    write_file.run({"path": current_task.filepath, "content": result.content})
 
     coder_state.current_step_idx += 1
 

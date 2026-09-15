@@ -88,6 +88,21 @@ class TaskPlan(BaseModel):
     )
 
 
+# Coder Output — the model's response for a single implementation step.
+# Deliberately plain (no tool-calling): the coder step reads existing file
+# content itself in Python and writes the result itself, so the model only
+# ever needs to answer with content, never invoke anything. This sidesteps
+# a broken multi-turn tool-calling path on some OpenAI-compatible gateways.
+class FileContent(BaseModel):
+    """
+    The complete content of the file being implemented for the current step.
+    """
+    content: str = Field(
+        ...,
+        description="The full, complete content to write to the target file"
+    )
+
+
 # Coder Runtime State
 class CoderState(BaseModel):
     """
