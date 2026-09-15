@@ -135,6 +135,24 @@ def api_delete_folder(path: str) -> str:
     return f"DELETED_FOLDER: {path}"
 
 
+def api_rename_item(old_path: str, new_path: str) -> str:
+    """Rename or move a file/folder within the project root."""
+    src = api_safe_path_for_project(old_path)
+    dst = api_safe_path_for_project(new_path)
+
+    if not src.exists():
+        return "ERROR: Source does not exist"
+
+    if dst.exists():
+        return "ERROR: Destination already exists"
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    src.rename(dst)
+
+    kind = "FOLDER" if dst.is_dir() else "FILE"
+    return f"RENAMED_{kind}: {old_path} -> {new_path}"
+
+
 # -------------------------------------------------------------------
 # Listing (API)
 # -------------------------------------------------------------------

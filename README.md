@@ -1,52 +1,18 @@
-# AI Project Builder – Runtime & Agentic Execution Platform
+# Agentbay — AI Project Generation Service
 
 ## Quick Start
 
 ### Prerequisites
 - Python 3.11+
-- PostgreSQL 13+ (running)
-- Docker
 - [uv](https://github.com/astral-sh/uv) package manager
-
-### Setup PostgreSQL with Docker
-```bash
-# Start PostgreSQL container
-docker run -d \
-  --name app-builder-postgres \
-  -e POSTGRES_USER=app_user \
-  -e POSTGRES_PASSWORD=app_password \
-  -e POSTGRES_DB=app_builder_db \
-  -p 5432:5432 \
-  postgres:latest
-
-# Verify it's running
-docker ps | grep app-builder-postgres
-```
-
-Update your `.env` file:
-```
-DATABASE_URL=postgresql+asyncpg://app_user:app_password@localhost:5432/app_builder_db
-```
 
 ### Setup
 ```bash
-# Clone and navigate to project
-cd /home/sanjay/Documents/ai-projects/app-builder
-
-# Sync dependencies with uv
 uv sync
+cp .env.example .env
+# fill in OPENAI_API_KEY / GROQ_API_KEY and set INTERNAL_SECRET
 
-# Activate virtual environment
-source .venv/bin/activate
-
-# Configure environment (create .env with DB credentials)
-# DATABASE_URL=postgresql+asyncpg://user:pass@localhost/app_builder_db
-
-# Initialize database
-aerich upgrade
-
-# Start the server
-uvicorn agent_v1.api.main:app --reload
+uv run uvicorn agent_v1.api.main:app --reload
 ```
 
 Access the API at **http://localhost:8000/docs**
@@ -55,202 +21,61 @@ Access the API at **http://localhost:8000/docs**
 
 ## Overview
 
-AI Project Builder is an **agentic, backend-first execution platform** designed to:
-
-* Generate Python projects using AI agents
-* Run projects inside isolated Docker containers
-* Provide **fully interactive WebSocket terminals** (xterm.js compatible)
-* Manage runtime state via PostgreSQL (Tortoise ORM)
-* Serve as a foundation for a **web-based AI IDE**
-
-The platform intentionally avoids REST-based execution in favor of **persistent WebSocket terminals**, similar to Replit or GitHub Codespaces.
-
----
-
-## Core Principles
-
-| Principle                 | Description                                            |
-| ------------------------- | ------------------------------------------------------ |
-| DB as Source of Truth     | PostgreSQL stores container metadata and runtime state |
-| Docker Isolation          | Each project runs in its own container                 |
-| WebSocket-First Execution | All command execution is interactive via PTY           |
-| Agent-Friendly            | Designed for AI agent orchestration and automation     |
-| Backend-First             | UI is a client, not a controller                       |
-
----
-
-## Current Architecture (Implemented)
+Agentbay is an **internal-only code-generation service**. It has no
+end-user auth, no database, and no container/runtime layer of its
+own — those concerns live in [ZeroTo](../../zeroto-backend), the
+platform that calls this service.
 
 ```
-Client (Web UI)
+ZeroTo control plane
+   │  X-Internal-Secret header (same trust pattern ZeroTo's
+   │  own node <-> control-plane calls use)
+   ▼
+Agentbay (this service)
    │
-   ├── REST APIs (metadata, files, lifecycle)
+   ├── LangGraph pipeline: planner -> architect -> coder
+   │     generates a Python project onto local scratch disk
    │
-   └── WebSocket (interactive terminal)
-        │
-FastAPI Backend
-   │
-   ├── PostgreSQL (runtime state)
-   ├── Docker Engine
-   └── AI Agent Pipeline
+   └── File tools: list / read / write / delete / rename,
+         scoped to a single project's directory
 ```
 
----
-
-## Implemented Features (As of Now)
-
-### Runtime & Container Management
-
-| Feature                                  | Status      |
-| ---------------------------------------- | ----------- |
-| DB-backed runtime repository             | ✅ Completed |
-| Docker ↔ DB reconciliation on startup    | ✅ Completed |
-| Container create / start / stop / delete | ✅ Completed |
-| Auto-reattach to existing containers     | ✅ Completed |
-| CPU & RAM limits                         | ✅ Completed |
-| WebSocket terminal (PTY-based)           | ✅ Completed |
-| Process manager (legacy)                 | ❌ Removed   |
+ZeroTo is responsible for: who the end user is, which org they
+belong to, quotas/plans, where the generated project actually runs
+(containers, volumes, terminal, ingress), and the finished "deploy"
+step. Agentbay only ever answers "generate this" or "read/write this
+file," for a project directory it's told about by name.
 
 ---
 
-### API Capabilities
+## API
 
-| Category           | Details                                 |
-| ------------------ | --------------------------------------- |
-| Project generation | AI agents generate full Python projects |
-| File listing       | Read-only file listing per project      |
-| File reading       | Read any project file                   |
-| Runtime status     | Container lifecycle status              |
-| Execution          | Interactive WebSocket terminal          |
+| Method | Endpoint | Purpose |
+| --- | --- | --- |
+| GET | `/health` | Liveness check (no auth) |
+| GET | `/projects` | List generated project directories |
+| POST | `/projects/generate` | Run the planner/architect/coder pipeline for a prompt |
+| GET | `/projects/{name}/files` | List files in a project |
+| GET | `/projects/{name}/files/read` | Read a file |
+| POST | `/projects/{name}/files/write` | Create/update a file |
+| DELETE | `/projects/{name}/files/delete` | Delete a file |
+| PUT | `/projects/{name}/files/rename` | Rename/move a file or folder |
+| POST | `/projects/{name}/folders/create` | Create a folder |
+| DELETE | `/projects/{name}/folders/delete` | Delete a folder recursively |
 
----
-
-## New Required Features (Requested)
-
-The following are **approved, required features**, ordered by **business and architectural priority**.
-
----
-
-## 🚀 Phase 1 – File Management & Editor Backend (Highest Priority)
-
-### Objective
-
-Enable **full CRUD operations** on project files and folders to support a web-based editor.
-
-### Required Capabilities
-
-| Feature           | Description                     |
-| ----------------- | ------------------------------- |
-| Create file       | Create new files in any project |
-| Create folder     | Create nested directories       |
-| Read file         | Already implemented             |
-| Update file       | Save edited file contents       |
-| Delete file       | Remove files                    |
-| Delete folder     | Remove directories recursively  |
-| Rename / move     | Rename files & folders          |
-| Project-level ops | Bulk actions (future-safe)      |
-
-### New APIs (Planned)
-
-| Method | Endpoint                        | Purpose               |
-| ------ | ------------------------------- | --------------------- |
-| POST   | `/projects/{name}/files/create` | Create file or folder |
-| PUT    | `/projects/{name}/files/write`  | Save file             |
-| DELETE | `/projects/{name}/files/delete` | Delete file/folder    |
-| POST   | `/projects/{name}/files/rename` | Rename / move         |
-
-### Notes
-
-* All paths **must be relative**
-* Strict project root isolation
-* Atomic writes (no partial saves)
-* UI editor (Monaco / CodeMirror) will consume these APIs
+Every route except `/health` requires `X-Internal-Secret: <INTERNAL_SECRET>`.
 
 ---
 
-## 🔐 Phase 2 – Security Hardening (High Priority)
+## What lives here vs. what moved to ZeroTo
 
-### Objective
-
-Make the platform safe for **multi-user and production environments**.
-
-### Planned Hardening Measures
-
-| Area          | Action                           |
-| ------------- | -------------------------------- |
-| Docker user   | Run containers as non-root       |
-| Privileges    | `no-new-privileges` flag         |
-| Capabilities  | Drop Linux capabilities          |
-| Seccomp       | Restrictive seccomp profile      |
-| FS isolation  | Read-only root FS where possible |
-| Network       | Restrict container networking    |
-| Rate limiting | API & WebSocket limits           |
-
-### Outcome
-
-* Prevent container breakout
-* Minimize blast radius
-* Production-ready security posture
-
----
-
-## 🛠️ Phase 3 – Admin & Ops (Critical for Scale)
-
-### Objective
-
-Provide **operational visibility and control** for administrators.
-
-### Admin APIs
-
-| Feature           | Description                       |
-| ----------------- | --------------------------------- |
-| List runtimes     | All projects & container states   |
-| Health metrics    | Runtime health                    |
-| Orphan cleanup    | Detect & remove unused containers |
-| Force stop/remove | Admin override                    |
-| Disk usage        | Per-project usage                 |
-| Audit logs        | Runtime & file operations         |
-
-### Example Admin Endpoints
-
-| Method | Endpoint                    |
-| ------ | --------------------------- |
-| GET    | `/admin/runtimes`           |
-| POST   | `/admin/runtimes/{id}/stop` |
-| DELETE | `/admin/runtimes/{id}`      |
-| GET    | `/admin/health`             |
-
----
-
-## Priority Roadmap (Final)
-
-| Priority | Phase   | Focus                     |
-| -------- | ------- | ------------------------- |
-| 🔴 P0    | Phase 1 | File editor CRUD backend  |
-| 🔴 P0    | Phase 1 | Folder management         |
-| 🟠 P1    | Phase 2 | Docker security hardening |
-| 🟠 P1    | Phase 2 | Privilege reduction       |
-| 🟡 P2    | Phase 3 | Admin & ops APIs          |
-| 🟡 P2    | Phase 3 | Cleanup jobs & monitoring |
-
----
-
-## What Is Explicitly NOT Included (Yet)
-
-* Authentication / RBAC
-* Multi-tenant isolation
-* Billing / quotas
-* CI/CD integrations
-
-These will be added **after** core stability.
-
----
-
-## Final Notes
-
-* The platform is **already stable and functional**
-* Upcoming work is **feature expansion**, not refactoring
-* WebSocket terminal is the **execution authority**
-* REST APIs are **control and metadata only**
+| Concern | Where |
+| --- | --- |
+| Prompt -> generated project files | Agentbay (this service) |
+| File CRUD on a generated project | Agentbay (this service) |
+| End-user auth, orgs, plans/quotas | ZeroTo |
+| Container lifecycle, terminal, live preview | ZeroTo |
+| Ingress, TLS, deploy | ZeroTo |
+| Persistent/durable storage of a project | ZeroTo (+ R2 snapshotting, planned) |
 
 ---

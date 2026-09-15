@@ -19,3 +19,7 @@ class ReadFileResponse(BaseModel):
 
 class WriteFileRequest(BaseModel):
     content: str
+
+class RenameFileRequest(BaseModel):
+    old_path: str
+    new_path: str
