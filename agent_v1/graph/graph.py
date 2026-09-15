@@ -16,11 +16,16 @@ from agent_v1.tools.project_root import create_project_root
 def get_llm() -> ChatOpenAI:
     """
     Centralized LLM factory.
-    Makes switching models or providers easy.
+
+    Points at an OpenAI-compatible endpoint via LLM_BASE_URL/LLM_API_KEY/
+    LLM_MODEL when set, so swapping providers/gateways is a config change,
+    not a code change. Falls back to OpenAI directly if unset.
     """
     return ChatOpenAI(
-        model="gpt-4o-mini-2024-07-18",
-        temperature=0.6
+        model=os.environ.get("LLM_MODEL", "gpt-4o-mini-2024-07-18"),
+        base_url=os.environ.get("LLM_BASE_URL") or None,
+        api_key=os.environ.get("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY"),
+        temperature=0.6,
     )
 
 def init_environment() -> None:
