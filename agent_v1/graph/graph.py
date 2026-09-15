@@ -33,7 +33,7 @@ def init_environment() -> None:
     Initialize environment variables once.
     Safe to call multiple times.
     """
-    os.environ.setdefault("LANGSMITH_TRACING", "true")
+    os.environ.setdefault("LANGSMITH_TRACING", "false")
     load_dotenv()
 
 # Agent Nodes
