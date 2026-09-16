@@ -1,10 +1,10 @@
 import io
 import tarfile
 
-from fastapi import FastAPI, HTTPException, Body, Query, Depends
+from fastapi import FastAPI, HTTPException, Body, Query, Depends, Form, File, UploadFile
 from fastapi.responses import JSONResponse, Response
 
-from agent_v1.graph.graph import run_agent
+from agent_v1.graph.graph import run_agent, run_modify
 from agent_v1.api.schemas.graph import (
     GenerateProjectRequest,
     GenerateProjectResponse,
@@ -26,7 +26,7 @@ from agent_v1.tools.utils import (
 )
 
 from agent_v1.api.project_utils import resolve_project_dir
-from agent_v1.tools.project_root import GENERATED_PROJECTS_ROOT
+from agent_v1.tools.project_root import GENERATED_PROJECTS_ROOT, create_project_root
 from agent_v1.core.logging import setup_logging
 from agent_v1.core.middleware import request_id_middleware
 from agent_v1.core.internal_auth import require_internal_secret
@@ -132,6 +132,42 @@ async def archive_project(project_name: str):
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w") as tar:
         tar.add(project_dir, arcname=".")
+
+    return Response(content=buffer.getvalue(), media_type="application/x-tar")
+
+
+@app.post(
+    "/projects/modify",
+    dependencies=[Depends(require_internal_secret)],
+)
+async def modify_project(
+    prompt: str = Form(...),
+    archive: UploadFile = File(...),
+):
+    """
+    One synchronous round trip: extracts the uploaded tar (the CURRENT
+    state of a project the caller already generated elsewhere - agentbay
+    has no memory of its own past generations) into a fresh scratch
+    directory, runs the modify graph against it, and returns the updated
+    project as a tar in the same shape /projects/{name}/archive does.
+    No project name/slug involved - the caller doesn't need one since
+    there's nothing to poll for, unlike /projects/generate.
+    """
+    project_dir = create_project_root("modify")
+
+    tar_bytes = await archive.read()
+    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r") as tar:
+        tar.extractall(project_dir)
+
+    result = await asyncio.to_thread(run_modify, str(project_dir), prompt)
+
+    coder_state = result.get("coder_state")
+    if not coder_state:
+        raise HTTPException(status_code=500, detail="Project modification failed")
+
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as out_tar:
+        out_tar.add(project_dir, arcname=".")
 
     return Response(content=buffer.getvalue(), media_type="application/x-tar")
 

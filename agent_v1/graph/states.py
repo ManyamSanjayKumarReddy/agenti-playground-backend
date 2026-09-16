@@ -142,3 +142,7 @@ class GraphState(TypedDict, total=False):
     task_plan: TaskPlan
     coder_state: CoderState
     status: str
+    # Set directly by callers of run_modify() (an existing project dir,
+    # not created by the graph) - unset for run_agent(), where coder_agent
+    # creates a fresh one itself from plan.name.
+    project_root: str

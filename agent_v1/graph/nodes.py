@@ -1,13 +1,19 @@
 """
-Agent nodes for the generation graph: planner -> architect -> coder.
+Agent nodes for the generation graph: planner -> architect -> coder
+(fresh build), or modify_planner -> coder (edit an existing project).
 """
 
 import logging
 
 from agent_v1.graph.llm import get_llm, invoke_structured_with_retry
 from agent_v1.graph.states import CoderState, FileContent, GraphState, Plan, TaskPlan
-from agent_v1.prompts.prompts import architect_prompt, coder_system_prompt, planner_prompt
-from agent_v1.tools.filesystem import read_file, set_project_root, write_file
+from agent_v1.prompts.prompts import (
+    architect_prompt,
+    coder_system_prompt,
+    modify_planner_prompt,
+    planner_prompt,
+)
+from agent_v1.tools.filesystem import list_files, read_file, set_project_root, write_file
 from agent_v1.tools.project_root import create_project_root
 
 logger = logging.getLogger("agentbay.graph")
@@ -44,6 +50,46 @@ def architect_agent(state: GraphState) -> GraphState:
         len(task_plan.implementation_steps),
     )
     return {"plan": plan, "task_plan": task_plan}
+
+
+def modify_planner_agent(state: GraphState) -> GraphState:
+    """
+    Converts a change request against an EXISTING project into a
+    TaskPlan - the modify-flow equivalent of architect_agent. Produces
+    the same schema architect_agent does, so coder_agent runs completely
+    unchanged regardless of which planner produced the plan.
+
+    Unlike planner/architect, project_root is already known here (the
+    caller extracted an existing project into it) rather than created by
+    coder_agent from a fresh plan.name - so this node also constructs
+    coder_state itself, pre-empting coder_agent's own "create a fresh
+    root" branch.
+    """
+    project_root = state["project_root"]
+    user_prompt = state["user_prompt"]
+    logger.info("modify_planner: starting for project_root=%s", project_root)
+
+    set_project_root(project_root)
+    listing = list_files.run(".")
+    existing_files = [] if listing.startswith("No files found") else listing.split("\n")
+
+    task_plan = invoke_structured_with_retry(
+        get_llm(), TaskPlan, modify_planner_prompt(existing_files, user_prompt)
+    )
+    if not task_plan:
+        raise ValueError("Modify planner agent returned empty output")
+
+    coder_state = CoderState(
+        task_plan=task_plan,
+        project_root=project_root,
+        current_step_idx=0,
+    )
+
+    logger.info(
+        "modify_planner: done, %d implementation steps",
+        len(task_plan.implementation_steps),
+    )
+    return {"task_plan": task_plan, "coder_state": coder_state}
 
 
 def coder_agent(state: GraphState) -> GraphState:

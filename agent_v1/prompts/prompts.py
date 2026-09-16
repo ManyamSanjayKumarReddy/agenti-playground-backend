@@ -110,6 +110,43 @@ OUTPUT CONSTRAINTS:
 - Do NOT include explanations, markdown, or extra text
 """
 
+# Modify Planner Prompt
+def modify_planner_prompt(existing_files: list[str], user_prompt: str) -> str:
+    """
+    Modify-planner agent prompt.
+    Converts a change request against an EXISTING project into a
+    TaskPlan, the same schema the architect produces for a fresh build -
+    so the coder agent can execute it completely unchanged.
+    """
+    file_list = "\n".join(f"- {f}" for f in existing_files) or "(no files yet)"
+
+    return f"""
+You are the MODIFY PLANNER agent.
+
+An existing project already has these files:
+{file_list}
+
+The user has requested this change:
+{user_prompt}
+
+Produce a TaskPlan: an ordered list of implementation steps needed to
+make this change - each step touches exactly ONE file, existing or
+new.
+
+CRITICAL RULES:
+- Only include files that actually need to change or be newly created
+  for this request - do NOT list every existing file
+- ALL file paths MUST be relative to the project root, matching the
+  existing file paths shown above exactly for files being modified
+- NEVER use absolute paths or ../ traversal
+- Prefer the smallest set of changes that correctly implements the
+  request - do not rewrite unrelated files
+
+OUTPUT CONSTRAINTS:
+- Output ONLY a TaskPlan object
+- Do NOT include explanations, markdown, or extra text
+"""
+
 # Coder System Prompt
 def coder_system_prompt() -> str:
     """
