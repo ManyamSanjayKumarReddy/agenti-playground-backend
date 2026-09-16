@@ -11,6 +11,8 @@ import os
 import time
 from typing import Any, Type, TypeVar
 
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_groq import ChatGroq
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 
@@ -19,8 +21,17 @@ logger = logging.getLogger("agentbay.llm")
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
 
 DEFAULT_MODEL = "gpt-4o-mini-2024-07-18"
+DEFAULT_GROQ_MODEL = "openai/gpt-oss-20b"
 DEFAULT_TEMPERATURE = 0.2
 DEFAULT_MAX_RETRY_ATTEMPTS = 5
+
+# Explicit output-token ceiling rather than leaving it unset. An unset
+# max_tokens against Groq defaults low enough that a full file's content
+# embedded as a JSON string value gets cut off mid-generation, which
+# breaks JSON validity outright (confirmed: json_validate_failed with a
+# visibly truncated failed_generation) - a hard failure with no retry
+# that can recover it, unlike the harmony-parsing error above.
+DEFAULT_MAX_TOKENS = 8192
 
 # Substring of a known vLLM/gpt-oss harmony-parsing error we retry
 # around: vllm-project/vllm#22403, fixed upstream in PR #23318 (merged
@@ -32,24 +43,46 @@ DEFAULT_MAX_RETRY_ATTEMPTS = 5
 _HARMONY_PARSE_ERROR_MARKER = "Expected 2 output messages"
 
 
-def get_llm() -> ChatOpenAI:
+def get_llm() -> BaseChatModel:
     """
     Centralized LLM factory.
 
-    Points at an OpenAI-compatible endpoint via LLM_BASE_URL/LLM_API_KEY/
-    LLM_MODEL when set, so swapping providers/gateways is a config
-    change, not a code change. Falls back to OpenAI directly if unset.
+    LLM_PROVIDER selects the provider ("groq" or the default
+    "openai_compatible"), so swapping providers/gateways is a config
+    change, not a code change.
+
+    - "groq": Groq's hosted inference (GROQ_API_KEY, LLM_MODEL - default
+      openai/gpt-oss-20b). Groq is an official gpt-oss inference partner
+      with correctly-working tool-calling, unlike a self-hosted vLLM
+      deployment without the harmony-format fixes - see the retry logic
+      below for the failure mode this sidesteps.
+    - "openai_compatible" (default): any OpenAI-compatible endpoint via
+      LLM_BASE_URL/LLM_API_KEY/LLM_MODEL, falling back to OPENAI_API_KEY
+      directly if unset.
     """
+    temperature = float(os.environ.get("LLM_TEMPERATURE", DEFAULT_TEMPERATURE))
+    max_tokens = int(os.environ.get("LLM_MAX_TOKENS", DEFAULT_MAX_TOKENS))
+    provider = os.environ.get("LLM_PROVIDER", "openai_compatible").lower()
+
+    if provider == "groq":
+        return ChatGroq(
+            model=os.environ.get("LLM_MODEL", DEFAULT_GROQ_MODEL),
+            api_key=os.environ.get("GROQ_API_KEY"),
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
     return ChatOpenAI(
         model=os.environ.get("LLM_MODEL", DEFAULT_MODEL),
         base_url=os.environ.get("LLM_BASE_URL") or None,
         api_key=os.environ.get("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY"),
-        temperature=float(os.environ.get("LLM_TEMPERATURE", DEFAULT_TEMPERATURE)),
+        temperature=temperature,
+        max_tokens=max_tokens,
     )
 
 
 def invoke_structured_with_retry(
-    llm: ChatOpenAI,
+    llm: BaseChatModel,
     schema: Type[SchemaT],
     messages: Any,
     max_attempts: int | None = None,
@@ -59,6 +92,14 @@ def invoke_structured_with_retry(
     retries on the known vLLM/gpt-oss harmony-parsing error above
     instead of failing the whole generation run on the first bad roll.
     Any other exception is raised immediately, unretried.
+
+    Forces method="json_schema" rather than relying on each provider's
+    own default strategy-detection for with_structured_output: gpt-oss's
+    "functions.<name>" tool-naming convention breaks the default
+    tool-calling-based extraction strategy on Groq (langchain_core raises
+    "Unknown tool type: 'functions.X'"). json_schema sidesteps
+    tool-calling for extraction entirely and has been reliable against
+    both providers this project has tested.
     """
     attempts = max_attempts or int(
         os.environ.get("LLM_RETRY_MAX_ATTEMPTS", DEFAULT_MAX_RETRY_ATTEMPTS)
@@ -67,7 +108,7 @@ def invoke_structured_with_retry(
 
     for attempt in range(1, attempts + 1):
         try:
-            return llm.with_structured_output(schema).invoke(messages)
+            return llm.with_structured_output(schema, method="json_schema").invoke(messages)
         except Exception as e:
             if _HARMONY_PARSE_ERROR_MARKER not in str(e):
                 raise
