@@ -33,14 +33,25 @@ DEFAULT_MAX_RETRY_ATTEMPTS = 5
 # that can recover it, unlike the harmony-parsing error above.
 DEFAULT_MAX_TOKENS = 8192
 
-# Substring of a known vLLM/gpt-oss harmony-parsing error we retry
-# around: vllm-project/vllm#22403, fixed upstream in PR #23318 (merged
-# Aug 2025) but only for vLLM versions after that. It's probabilistic
-# per generation, not deterministic, so retrying the same request is a
-# real (if partial) mitigation - confirmed empirically against a live
-# gateway. It is NOT a substitute for upgrading vLLM: on anything beyond
-# trivial output it can still fail every retry.
-_HARMONY_PARSE_ERROR_MARKER = "Expected 2 output messages"
+# Substrings of known malformed-structured-output errors we retry
+# around, all probabilistic per generation rather than deterministic -
+# each confirmed empirically against a live gateway, not theoretical:
+#   - "Expected 2 output messages": vLLM/gpt-oss harmony-parsing bug,
+#     vllm-project/vllm#22403, fixed upstream in PR #23318 (merged Aug
+#     2025) but only for vLLM versions after that. NOT a substitute for
+#     upgrading vLLM - on anything beyond trivial output it can still
+#     fail every retry there.
+#   - "output_parse_failed" / "Parsing failed": Groq's json_schema mode
+#     occasionally returns a bare reasoning fragment (e.g. "We need to
+#     output JSON object.") instead of completing the actual JSON -
+#     observed as a one-off amid many successful calls, so a retry is a
+#     reasonable mitigation (unlike the vLLM bug, not expected to be
+#     anywhere near this frequent).
+_RETRYABLE_ERROR_MARKERS = (
+    "Expected 2 output messages",
+    "output_parse_failed",
+    "Parsing failed",
+)
 
 
 def get_llm() -> BaseChatModel:
@@ -89,9 +100,9 @@ def invoke_structured_with_retry(
 ) -> SchemaT:
     """
     Same as llm.with_structured_output(schema).invoke(messages), but
-    retries on the known vLLM/gpt-oss harmony-parsing error above
-    instead of failing the whole generation run on the first bad roll.
-    Any other exception is raised immediately, unretried.
+    retries on the known malformed-output errors above instead of
+    failing the whole generation run on the first bad roll. Any other
+    exception is raised immediately, unretried.
 
     Forces method="json_schema" rather than relying on each provider's
     own default strategy-detection for with_structured_output: gpt-oss's
@@ -110,12 +121,13 @@ def invoke_structured_with_retry(
         try:
             return llm.with_structured_output(schema, method="json_schema").invoke(messages)
         except Exception as e:
-            if _HARMONY_PARSE_ERROR_MARKER not in str(e):
+            error_str = str(e)
+            if not any(marker in error_str for marker in _RETRYABLE_ERROR_MARKERS):
                 raise
 
             last_error = e
             logger.warning(
-                "Harmony-parsing error on attempt %d/%d, %s",
+                "Malformed structured-output error on attempt %d/%d, %s",
                 attempt,
                 attempts,
                 "retrying" if attempt < attempts else "giving up",
