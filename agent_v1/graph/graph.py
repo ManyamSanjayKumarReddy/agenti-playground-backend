@@ -1,144 +1,43 @@
+"""
+Generation graph: planner -> architect -> coder (looped until done).
+
+This module only wires the graph together. LLM setup lives in
+agent_v1.graph.llm, node logic in agent_v1.graph.nodes, state shapes in
+agent_v1.graph.states.
+"""
+
+import logging
 import os
-from typing import Dict, Any
 
 from dotenv import load_dotenv
-from langchain_openai import ChatOpenAI
-from langgraph.graph import StateGraph
 from langgraph.constants import END
+from langgraph.graph import StateGraph
+from langgraph.graph.state import CompiledStateGraph
 
-from agent_v1.graph.states import File, Plan, TaskPlan, CoderState, FileContent
-from agent_v1.prompts.prompts import planner_prompt, architect_prompt, coder_system_prompt
-from agent_v1.tools.filesystem import read_file, write_file, set_project_root
-from agent_v1.tools.project_root import create_project_root
+from agent_v1.graph.nodes import architect_agent, coder_agent, planner_agent
+from agent_v1.graph.states import GraphState
 
-# Environment & LLM Setup
-def get_llm() -> ChatOpenAI:
-    """
-    Centralized LLM factory.
+logger = logging.getLogger("agentbay.graph")
 
-    Points at an OpenAI-compatible endpoint via LLM_BASE_URL/LLM_API_KEY/
-    LLM_MODEL when set, so swapping providers/gateways is a config change,
-    not a code change. Falls back to OpenAI directly if unset.
-    """
-    return ChatOpenAI(
-        model=os.environ.get("LLM_MODEL", "gpt-4o-mini-2024-07-18"),
-        base_url=os.environ.get("LLM_BASE_URL") or None,
-        api_key=os.environ.get("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY"),
-        temperature=0.6,
-    )
 
 def init_environment() -> None:
     """
-    Initialize environment variables once.
-    Safe to call multiple times.
+    Initialize environment variables once. Safe to call multiple times.
     """
     os.environ.setdefault("LANGSMITH_TRACING", "false")
     load_dotenv()
 
-# Agent Nodes
-def planner_agent(state: Dict[str, Any]) -> Dict[str, Any]:
+
+def _coder_next_step(state: GraphState) -> str:
+    return "END" if state.get("status") == "DONE" else "coder"
+
+
+def build_graph() -> CompiledStateGraph:
     """
-    Converts user prompt into a structured Plan.
+    Builds and compiles the generation graph. Safe to reuse across API
+    calls - it holds no per-run state itself.
     """
-    llm = get_llm()
-    user_prompt = state["user_prompt"]
-
-    plan = llm.with_structured_output(Plan).invoke(
-        planner_prompt(user_prompt)
-    )
-
-    if not plan:
-        raise ValueError("Planner agent returned empty output")
-
-    return {"plan": plan}
-
-
-def architect_agent(state: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Converts Plan into TaskPlan.
-    """
-    llm = get_llm()
-    plan: Plan = state["plan"]
-
-    task_plan = llm.with_structured_output(TaskPlan).invoke(
-        architect_prompt(plan)
-    )
-
-    if not task_plan:
-        raise ValueError("Architect agent returned empty output")
-
-    return { "plan": plan, "task_plan": task_plan}
-
-
-def coder_agent(state: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Single-action-per-step coding agent.
-
-    Deliberately does NOT use tool-calling / bound tools: some
-    OpenAI-compatible gateways (self-hosted vLLM serving gpt-oss, in
-    particular) don't reliably support multi-turn function-calling yet.
-    Structured output (used here, same as planner/architect) doesn't hit
-    that code path and has been reliable in practice, so this step reads
-    the existing file itself, asks the model only for the new content,
-    and writes it itself - the model never needs to invoke anything.
-    """
-    llm = get_llm()
-
-    coder_state: CoderState | None = state.get("coder_state")
-
-    if coder_state is None:
-        project_dir = create_project_root(state["plan"].name)
-        coder_state = CoderState(
-            task_plan=state["task_plan"],
-            project_root=str(project_dir),
-            current_step_idx=0
-        )
-
-    set_project_root(coder_state.project_root)
-
-    steps = coder_state.task_plan.implementation_steps
-
-    if coder_state.current_step_idx >= len(steps):
-        return {
-            "coder_state": coder_state,
-            "status": "DONE"
-        }
-
-    current_task = steps[coder_state.current_step_idx]
-
-    existing_content = read_file.run(current_task.filepath)
-
-    system_prompt = coder_system_prompt()
-    user_prompt = (
-        f"Task: {current_task.task_description}\n"
-        f"File: {current_task.filepath}\n\n"
-        f"Existing Content:\n{existing_content}\n\n"
-        "Respond with the complete file content."
-    )
-
-    result = llm.with_structured_output(FileContent).invoke(
-        [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
-    )
-
-    if not result:
-        raise ValueError("Coder agent returned empty output")
-
-    write_file.run({"path": current_task.filepath, "content": result.content})
-
-    coder_state.current_step_idx += 1
-
-    return {"coder_state": coder_state}
-
-# Graph Factory
-def build_graph():
-    """
-    Builds and compiles the LangGraph.
-    Safe to reuse across API calls.
-    """
-    graph = StateGraph(dict)
+    graph = StateGraph(GraphState)
 
     graph.add_node("planner", planner_agent)
     graph.add_node("architect", architect_agent)
@@ -149,36 +48,32 @@ def build_graph():
 
     graph.add_conditional_edges(
         "coder",
-        lambda state: "END" if state.get("status") == "DONE" else "coder",
-        {
-            "END": END,
-            "coder": "coder"
-        }
+        _coder_next_step,
+        {"END": END, "coder": "coder"},
     )
 
     graph.set_entry_point("planner")
 
     return graph.compile()
 
-# Public API (FastAPI-friendly)
-def run_agent(user_prompt: str) -> Dict[str, Any]:
+
+def run_agent(user_prompt: str) -> GraphState:
     """
-    Public callable entry point.
-    This is what FastAPI should call.
+    Public callable entry point. This is what the API calls.
     """
     init_environment()
-    agent = build_graph()
+    logger.info("run_agent: starting generation")
 
-    return agent.invoke(
-        {"user_prompt": user_prompt}
-    )
+    agent = build_graph()
+    result = agent.invoke({"user_prompt": user_prompt})
+
+    logger.info("run_agent: finished with status=%s", result.get("status"))
+    return result
 
 
 # Local CLI Test
 if __name__ == "__main__":
-    result = run_agent(
-        "build an 404 error page using internal css and html"
-    )
+    final_state = run_agent("build an 404 error page using internal css and html")
 
     print("Final State:")
-    print(result)
+    print(final_state)

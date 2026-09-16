@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Optional, TypedDict
 
 # File Definition
 class File(BaseModel):
@@ -127,3 +127,18 @@ class CoderState(BaseModel):
         None,
         description="Current content of the file being edited"
     )
+
+
+class GraphState(TypedDict, total=False):
+    """
+    Top-level state threaded through the generation graph.
+
+    total=False because each key is populated progressively as the graph
+    advances (user_prompt -> plan -> task_plan -> coder_state), not all
+    present from the start.
+    """
+    user_prompt: str
+    plan: Plan
+    task_plan: TaskPlan
+    coder_state: CoderState
+    status: str
